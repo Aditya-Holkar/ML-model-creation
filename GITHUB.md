@@ -56,7 +56,7 @@ dataforge/
 ├── app.py                  # Streamlit entry point (5 screens, ~620 lines)
 ├── pipeline/
 │   ├── ingest.py           # CSV/Excel reader
-│   ├── profile.py          # ydata-profiling integration
+│   ├── profile.py          # Auto-generated HTML profile (pandas-based, no heavy deps)
 │   ├── clean.py            # 10 cleaning functions
 │   ├── format.py           # JSONL formatting (instruction + chat)
 │   └── playground.py       # Screen 5: Predict, Explore, Feature, Chat
