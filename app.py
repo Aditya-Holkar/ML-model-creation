@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import tempfile
 from datetime import datetime
@@ -67,6 +68,264 @@ class GeneratedModel:
             "accuracy": round(accuracy_score(y, preds), 4),
             "classification_report": classification_report(y, preds, output_dict=True, zero_division=0),
         }
+'''
+
+
+def _safe_model_code():
+    return '''import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.cluster import KMeans
+from sklearn.metrics import accuracy_score, r2_score, classification_report
+
+class GeneratedModel:
+    def __init__(self):
+        self.model = None
+        self._mode = "cls"
+
+    def _prepare_X(self, df, text_cols):
+        X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
+        if X.shape[1] == 0:
+            X = pd.DataFrame(np.zeros((len(df), 1)), columns=["_fb"])
+        return X
+
+    def _prepare_y(self, df, label_cols):
+        if not label_cols:
+            return None
+        y = df[label_cols[0]].ffill().bfill().fillna(0)
+        if y.dtype.kind == "b":
+            y = y.astype(int)
+        return y
+
+    def train(self, df, text_cols, label_cols):
+        X = self._prepare_X(df, text_cols)
+        y = self._prepare_y(df, label_cols)
+        if y is not None:
+            if y.dtype.kind in ("O",) or y.nunique() < 20:
+                self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+                self._mode = "cls"
+            else:
+                self.model = RandomForestRegressor(n_estimators=100, random_state=42)
+                self._mode = "reg"
+            self.model.fit(X, y)
+        else:
+            self.model = KMeans(n_clusters=min(3, len(X)), random_state=42, n_init="auto")
+            self.model.fit(X)
+            self._mode = "unsup"
+
+    def predict(self, df, text_cols):
+        X = self._prepare_X(df, text_cols)
+        return self.model.predict(X)
+
+    def evaluate(self, df, text_cols, label_cols):
+        X = self._prepare_X(df, text_cols)
+        y = self._prepare_y(df, label_cols)
+        if y is None:
+            return {"note": "Unsupervised model trained", "clusters": int(self.model.n_clusters)}
+        preds = self.model.predict(X)
+        if self._mode == "cls":
+            return {"accuracy": round(accuracy_score(y, preds), 4), "classification_report": classification_report(y, preds, output_dict=True, zero_division=0)}
+        return {"r2_score": round(r2_score(y, preds), 4), "predictions_sample": preds[:5].tolist()}
+'''
+
+
+def _assess_training_readiness(df, text_cols, label_cols):
+    """Analyze data compatibility and recommend the right model approach."""
+    import numpy as np
+    result = {"ready": True, "warnings": [], "recommendation": None, "task_type": "clustering"}
+
+    if not text_cols:
+        result["ready"] = False
+        result["warnings"].append("No feature columns selected.")
+        return result
+
+    n_rows = len(df)
+    if n_rows == 0:
+        result["ready"] = False
+        result["warnings"].append("Dataset is empty.")
+        return result
+
+    features = [c for c in text_cols if c in df.columns]
+    numeric = [c for c in features if pd.api.types.is_numeric_dtype(df[c])]
+    categorical = [c for c in features if not pd.api.types.is_numeric_dtype(df[c]) and c in df.columns]
+
+    result["row_count"] = n_rows
+    result["feature_count"] = len(features)
+    result["numeric_features"] = numeric[:10]
+    result["categorical_features"] = categorical[:10]
+
+    if len(features) == 0:
+        result["ready"] = False
+        result["warnings"].append("No valid feature columns found.")
+        return result
+
+    if not numeric:
+        result["warnings"].append("No numeric features detected. Model will use a synthetic fallback feature.")
+
+    if label_cols:
+        label = [c for c in label_cols if c in df.columns]
+        if not label:
+            result["ready"] = False
+            result["warnings"].append("Label column not found in dataframe.")
+            return result
+
+        y = df[label[0]].dropna()
+        nunique = y.nunique()
+        total = len(y)
+        result["label_cardinality"] = int(nunique)
+        result["label_samples"] = int(total)
+        result["label_distribution"] = y.value_counts().head(10).to_dict()
+
+        if total < 10:
+            result["warnings"].append(f"Only {total} labeled samples — results may be unreliable.")
+
+        if y.dtype.kind in ("O", "b") or nunique < 20:
+            result["task_type"] = "classification"
+            if nunique == 2:
+                result["recommendation"] = "binary_classification"
+            elif nunique <= 10:
+                result["recommendation"] = f"multiclass_classification_{nunique}_classes"
+            else:
+                result["warnings"].append(f"High cardinality label ({nunique} classes). Consider grouping rare classes.")
+
+            if nunique > total * 0.5:
+                result["warnings"].append(f"Each class has very few samples ({total}/{nunique} ≈ {total//max(nunique,1):.0f}/class).")
+
+            top_class_pct = (y.value_counts().iloc[0] / total * 100) if total > 0 else 0
+            if top_class_pct > 80:
+                result["warnings"].append(f"Class imbalance: '{y.value_counts().index[0]}' dominates ({top_class_pct:.0f}%).")
+        else:
+            result["task_type"] = "regression"
+            result["recommendation"] = "regression"
+            if nunique < 30 and total > 100:
+                result["warnings"].append(f"Only {nunique} unique label values — consider treating as classification.")
+    else:
+        result["task_type"] = "clustering"
+        result["recommendation"] = "clustering"
+        if n_rows < 5:
+            result["warnings"].append("Too few rows for meaningful clustering.")
+
+    return result
+
+
+def _model_code_for_assessment(assessment):
+    """Return the best model code template based on data assessment."""
+    task = assessment.get("task_type", "clustering")
+    reco = assessment.get("recommendation", "")
+
+    if task == "regression":
+        # Regression-safe template
+        return '''import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score
+
+class GeneratedModel:
+    def __init__(self):
+        self.model = RandomForestRegressor(n_estimators=100, random_state=42)
+
+    def _prepare_X(self, df, text_cols):
+        X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
+        if X.shape[1] == 0:
+            X = pd.DataFrame(np.zeros((len(df), 1)), columns=["_fb"])
+        return X
+
+    def _prepare_y(self, df, label_cols):
+        if not label_cols:
+            return None
+        y = df[label_cols[0]].ffill().bfill().fillna(0)
+        if y.dtype.kind == "b":
+            y = y.astype(int)
+        return y
+
+    def train(self, df, text_cols, label_cols):
+        X = self._prepare_X(df, text_cols)
+        y = self._prepare_y(df, label_cols)
+        self.model.fit(X, y)
+
+    def predict(self, df, text_cols):
+        X = self._prepare_X(df, text_cols)
+        return self.model.predict(X)
+
+    def evaluate(self, df, text_cols, label_cols):
+        X = self._prepare_X(df, text_cols)
+        y = self._prepare_y(df, label_cols)
+        if y is None:
+            return {"note": "No labels"}
+        preds = self.model.predict(X)
+        return {"r2_score": round(r2_score(y, preds), 4), "predictions_sample": preds[:5].tolist()}
+'''
+    elif task == "clustering":
+        return '''import pandas as pd
+import numpy as np
+from sklearn.cluster import KMeans
+
+class GeneratedModel:
+    def __init__(self):
+        self.model = None
+
+    def _prepare_X(self, df, text_cols):
+        X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
+        if X.shape[1] == 0:
+            X = pd.DataFrame(np.zeros((len(df), 1)), columns=["_fb"])
+        return X
+
+    def train(self, df, text_cols, label_cols):
+        X = self._prepare_X(df, text_cols)
+        n = min(3, len(X))
+        self.model = KMeans(n_clusters=n, random_state=42, n_init="auto")
+        self.model.fit(X)
+
+    def predict(self, df, text_cols):
+        X = self._prepare_X(df, text_cols)
+        return self.model.predict(X)
+
+    def evaluate(self, df, text_cols, label_cols):
+        X = self._prepare_X(df, text_cols)
+        preds = self.model.predict(X)
+        return {"note": "Clustering completed", "clusters": int(self.model.n_clusters), "cluster_distribution": {int(k): int(v) for k, v in pd.Series(preds).value_counts().to_dict().items()}}
+'''
+    else:
+        # Classification-safe template
+        return '''import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+
+class GeneratedModel:
+    def __init__(self):
+        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+
+    def _prepare_X(self, df, text_cols):
+        X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
+        if X.shape[1] == 0:
+            X = pd.DataFrame(np.zeros((len(df), 1)), columns=["_fb"])
+        return X
+
+    def _prepare_y(self, df, label_cols):
+        if not label_cols:
+            return None
+        y = df[label_cols[0]].ffill().bfill().fillna(0)
+        if y.dtype.kind == "b":
+            y = y.astype(int)
+        return y
+
+    def train(self, df, text_cols, label_cols):
+        X = self._prepare_X(df, text_cols)
+        y = self._prepare_y(df, label_cols)
+        self.model.fit(X, y)
+
+    def predict(self, df, text_cols):
+        X = self._prepare_X(df, text_cols)
+        return self.model.predict(X)
+
+    def evaluate(self, df, text_cols, label_cols):
+        X = self._prepare_X(df, text_cols)
+        y = self._prepare_y(df, label_cols)
+        if y is None:
+            return {"note": "No labels for evaluation"}
+        preds = self.model.predict(X)
+        return {"accuracy": round(accuracy_score(y, preds), 4), "classification_report": classification_report(y, preds, output_dict=True, zero_division=0)}
 '''
 
 
@@ -160,7 +419,10 @@ if screen == "1. Upload & Configure":
     if st.session_state.df is not None:
         df = st.session_state.df
         st.subheader("Preview")
-        st.dataframe(df.head(5), use_container_width=True)
+        try:
+            st.dataframe(df.head(5), use_container_width=True)
+        except Exception as e:
+            st.error(f"Preview unavailable: {e}")
 
         st.subheader("Column Configuration")
         cols = list(df.columns)
@@ -178,14 +440,18 @@ if screen == "1. Upload & Configure":
             sel_drop_cols = st.multiselect("Columns to drop", cols, key="widget_drop_cols")
 
         if st.button("Apply & Proceed"):
-            if not use_all and not sel_text_cols:
-                st.error("Select at least one input column.")
+            try:
+                if not use_all and not sel_text_cols:
+                    st.error("Select at least one input column.")
+                    st.stop()
+                df = df.drop(columns=sel_drop_cols, errors="ignore")
+                st.session_state.df = df
+                st.session_state.text_cols = sel_text_cols
+                st.session_state.label_cols = sel_label_cols
+                st.success("Configuration saved. Go to Profile & Clean.")
+            except Exception as e:
+                st.error(f"Apply failed: {e}")
                 st.stop()
-            df = df.drop(columns=sel_drop_cols, errors="ignore")
-            st.session_state.df = df
-            st.session_state.text_cols = sel_text_cols
-            st.session_state.label_cols = sel_label_cols
-            st.success("Configuration saved. Go to Profile & Clean.")
 
 # ─────────────────────────────────────────────
 # SCREEN 2: PROFILE & CLEAN
@@ -209,7 +475,10 @@ elif screen == "2. Profile & Clean":
 
     if st.session_state.profile_html:
         with st.expander("Data Profile Report", expanded=False):
-            st.components.v1.html(st.session_state.profile_html, height=600, scrolling=True)
+            try:
+                st.components.v1.html(st.session_state.profile_html, height=600, scrolling=True)
+            except Exception as e:
+                st.caption(f"Profile preview unavailable: {e}")
 
     st.divider()
 
@@ -240,60 +509,92 @@ elif screen == "2. Profile & Clean":
             do_snake = st.checkbox("Rename columns to snake_case", value=False)
             do_parse_dates = st.checkbox("Parse date columns", value=True)
 
+    def _reconcile_column_names(stored, original_cols, cleaned_df):
+        """Map stored column names to their equivalents in cleaned_df (handles renames & drops)."""
+        if not stored:
+            return stored
+        cleaned_cols = set(cleaned_df.columns)
+        result = []
+        for col in stored:
+            if col in cleaned_cols:
+                result.append(col)
+            elif col in original_cols:
+                snake = col.strip().lower()
+                snake = re.sub(r"[^a-z0-9_]", "_", snake)
+                snake = re.sub(r"_+", "_", snake).strip("_")
+                if snake in cleaned_cols:
+                    result.append(snake)
+        return result if result else None
+
     if st.button("Run Cleaning"):
-        cleaned = df.copy()
-        changes = []
+        try:
+            cleaned = df.copy()
+            changes = []
+            original_cols = set(df.columns)
 
-        if do_drop_null:
-            cleaned, ch = drop_high_null(cleaned)
-            changes.append(ch)
+            if do_drop_null:
+                cleaned, ch = drop_high_null(cleaned)
+                changes.append(ch)
 
-        if do_dedup:
-            cleaned, ch = deduplicate(cleaned)
-            changes.append(ch)
+            if do_dedup:
+                cleaned, ch = deduplicate(cleaned)
+                changes.append(ch)
 
-        if do_remove_empty:
-            cleaned, ch = remove_empty_rows(cleaned)
-            changes.append(ch)
+            if do_remove_empty:
+                cleaned, ch = remove_empty_rows(cleaned)
+                changes.append(ch)
 
-        if do_replace_nulls:
-            cleaned, ch = replace_placeholder_nulls(cleaned)
-            changes.append(ch)
+            if do_replace_nulls:
+                cleaned, ch = replace_placeholder_nulls(cleaned)
+                changes.append(ch)
 
-        if do_impute:
-            cleaned, ch = impute_missing(cleaned)
-            changes.append(ch)
+            if do_impute:
+                cleaned, ch = impute_missing(cleaned)
+                changes.append(ch)
 
-        if do_strip:
-            cleaned, ch = strip_whitespace(cleaned)
-            changes.append(ch)
+            if do_strip:
+                cleaned, ch = strip_whitespace(cleaned)
+                changes.append(ch)
 
-        if do_lowercase:
-            cleaned, ch = lowercase_text(cleaned)
-            changes.append(ch)
+            if do_lowercase:
+                cleaned, ch = lowercase_text(cleaned)
+                changes.append(ch)
 
-        if do_parse_dates:
-            cleaned, ch = parse_dates(cleaned)
-            changes.append(ch)
+            if do_parse_dates:
+                cleaned, ch = parse_dates(cleaned)
+                changes.append(ch)
 
-        if do_outliers:
-            cleaned, ch = remove_outliers(cleaned)
-            changes.append(ch)
+            if do_outliers:
+                cleaned, ch = remove_outliers(cleaned)
+                changes.append(ch)
 
-        if do_snake:
-            cleaned, ch = rename_to_snake_case(cleaned)
-            changes.append(ch)
+            if do_snake:
+                cleaned, ch = rename_to_snake_case(cleaned)
+                changes.append(ch)
 
-        st.session_state.cleaned = cleaned
-
-        st.success("Cleaning complete!")
-        for ch in changes:
-            st.info(ch["reason"])
+            # Reconcile stored column names with cleaned dataframe
+            old_text = st.session_state.get("text_cols")
+            old_label = st.session_state.get("label_cols")
+            st.session_state.text_cols = _reconcile_column_names(old_text, original_cols, cleaned)
+            st.session_state.label_cols = _reconcile_column_names(old_label, original_cols, cleaned)
+            st.session_state.cleaned = cleaned
+            st.success("Cleaning complete!")
+            for ch in changes:
+                try:
+                    st.info(ch["reason"])
+                except Exception:
+                    pass
+        except Exception as e:
+            st.error(f"Cleaning failed: {e}")
+            st.stop()
 
     if st.session_state.cleaned is not None:
         st.divider()
         st.subheader("Before vs After")
-        show_before_after(st.session_state.df_original, st.session_state.cleaned)
+        try:
+            show_before_after(st.session_state.df_original, st.session_state.cleaned)
+        except Exception as e:
+            st.caption(f"Comparison view unavailable: {e}")
 
 # ─────────────────────────────────────────────
 # SCREEN 3: FORMAT & EXPORT
@@ -308,6 +609,15 @@ elif screen == "3. Format & Export":
     cleaned = st.session_state.cleaned
     text_cols = st.session_state.get("text_cols")
     label_cols = st.session_state.get("label_cols")
+
+    # Validate stored columns against cleaned dataframe (handles renames/drops)
+    valid_cols = set(cleaned.columns)
+    if text_cols and not all(c in valid_cols for c in text_cols):
+        missing = [c for c in text_cols if c not in valid_cols]
+        st.warning(f"Stored columns not found after cleaning: {missing}. Please re-select.")
+        text_cols = None
+    if label_cols and not all(c in valid_cols for c in label_cols):
+        label_cols = None
 
     if not text_cols:
         cols = list(cleaned.columns)
@@ -346,8 +656,11 @@ elif screen == "3. Format & Export":
     st.divider()
     st.subheader("Downloads")
 
-    csv_bytes = cleaned.to_csv(index=False).encode()
-    st.download_button("Download Clean CSV", csv_bytes, file_name="clean_data.csv")
+    try:
+        csv_bytes = cleaned.to_csv(index=False).encode()
+        st.download_button("Download Clean CSV", csv_bytes, file_name="clean_data.csv")
+    except Exception as e:
+        st.error(f"CSV export failed: {e}")
 
     if "instruction_str" in st.session_state and st.session_state.instruction_str:
         st.download_button("Download Instruction JSONL", st.session_state.instruction_str.encode(), file_name="instruction_data.jsonl")
@@ -393,10 +706,62 @@ elif screen == "4. Fine-Tune":
     text_cols = st.session_state.get("text_cols", [])
     label_cols = st.session_state.get("label_cols", [])
 
+    # Validate stored columns against cleaned dataframe
+    valid_columns = list(cleaned.columns)
+    valid_set = set(valid_columns)
+    if text_cols and not all(c in valid_set for c in text_cols):
+        missing = [c for c in text_cols if c not in valid_set]
+        st.warning(f"Stored input columns not found after cleaning: {missing}. Please re-select below.")
+        text_cols = None
+    if label_cols and not all(c in valid_set for c in label_cols):
+        label_cols = None
+
+    # Column pickers (shown when stored columns are missing or invalid)
+    with st.expander("Column Configuration for Training", expanded=not text_cols):
+        c1, c2 = st.columns(2)
+        with c1:
+            ft_text = st.multiselect(
+                "Input/feature columns",
+                valid_columns,
+                default=text_cols if text_cols else valid_columns[:min(3, len(valid_columns))],
+                key="ft_text_cols",
+            )
+        with c2:
+            ft_label = st.multiselect("Output/label columns (optional)", valid_columns, default=label_cols if label_cols else [], key="ft_label_cols") or None
+        if ft_text:
+            text_cols = ft_text
+            label_cols = ft_label
+
     has_groq = bool(GROQ_API_KEY)
     if not has_groq:
         with st.warning("GROQ_API_KEY not set — AI generation disabled. Enter model code manually below."):
             st.caption("Set `GROQ_API_KEY` in `.env` to enable AI suggestion & code generation.")
+
+    # ── Data Compatibility Assessment ──
+    assessment = None
+    if text_cols:
+        assessment = _assess_training_readiness(cleaned, text_cols, label_cols)
+        if assessment:
+            ready = assessment.get("ready", True)
+            task_type = assessment.get("task_type", "unknown").title()
+            n_feat = assessment.get("feature_count", 0)
+            n_rows = assessment.get("row_count", 0)
+            warnings = assessment.get("warnings", [])
+
+            if ready:
+                st.success(f"Data ready for **{task_type}** ({n_feat} features, {n_rows} rows)")
+            else:
+                st.error(f"Cannot train: {'; '.join(warnings)}")
+
+            if warnings:
+                with st.expander("Data Compatibility Warnings", expanded=False):
+                    for w in warnings:
+                        st.caption(f"⚠ {w}")
+
+            if assessment.get("label_distribution"):
+                with st.expander("Label Distribution (top 10)", expanded=False):
+                    dist = assessment["label_distribution"]
+                    st.json({str(k): int(v) for k, v in dist.items()})
 
     # ── Step 1: Describe → Generate Code ──
     st.subheader("Step 1: Describe or Paste Your Model Code")
@@ -417,6 +782,7 @@ elif screen == "4. Fine-Tune":
             "columns": list(cleaned.columns),
             "dtypes": {c: str(cleaned[c].dtype) for c in cleaned.columns},
             "sample": {c: cleaned[c].dropna().head(5).tolist() for c in cleaned.columns[:5]},
+            "assessment": assessment,
         }
 
         if st.button("🤖 Suggest Model (AI Advice)", disabled=not model_desc) and model_desc:
@@ -442,11 +808,9 @@ elif screen == "4. Fine-Tune":
 
     # Manual code editor (shown when no API key, or after generation)
     if not has_groq:
-        DEFAULT_TEMPLATE = """# Paste your sklearn model code here.
+        task_hint = assessment.get("task_type", "model").title() if assessment else "Model"
+        DEFAULT_TEMPLATE = f"""# Paste your sklearn model code here, or click one of the buttons below.
 # It must define a class with train() and evaluate() methods.
-# Example:
-# from sklearn.ensemble import RandomForestClassifier
-# from sklearn.metrics import accuracy_score
 #
 # class GeneratedModel:
 #     def train(self, df, text_cols, label_cols):
@@ -457,11 +821,15 @@ elif screen == "4. Fine-Tune":
         manual_code = st.text_area("Model Code (Python)", value=st.session_state.get("manual_code", DEFAULT_TEMPLATE), height=300)
         st.session_state.manual_code = manual_code
 
-        col_a, col_b = st.columns(2)
+        col_a, col_b, col_c = st.columns(3)
         with col_a:
             apply_btn = st.button("Use This Code", type="primary")
         with col_b:
-            if st.button("Use Iris Classifier (Quick Demo)"):
+            if st.button(f"Use Recommended ({task_hint})"):
+                st.session_state.manual_code = _model_code_for_assessment(assessment) if assessment else _safe_model_code()
+                st.rerun()
+        with col_c:
+            if st.button("Iris Classifier (Demo)"):
                 st.session_state.manual_code = _quick_demo_code()
                 st.rerun()
 
@@ -478,13 +846,15 @@ elif screen == "4. Fine-Tune":
         with st.spinner("Generating custom ML model code..."):
             try:
                 result = generate_model(model_desc, df_info, GROQ_API_KEY)
-                st.session_state.generated_model = result
-                if result["compiles"]:
-                    st.success("Model code generated and verified!")
-                else:
-                    st.error("Generated code has syntax errors. Try a different description.")
+                if not result.get("compiles"):
+                    st.warning("AI-generated code has syntax errors. Using pre-built model for your data type instead.")
+                    result = {"model_path": None, "code": _model_code_for_assessment(assessment) if assessment else _safe_model_code(), "compiles": True}
             except Exception as e:
-                st.error(f"Generation failed: {e}")
+                st.warning(f"AI generation failed ({e}). Using pre-built model for your data.")
+                result = {"model_path": None, "code": _model_code_for_assessment(assessment) if assessment else _safe_model_code(), "compiles": True}
+            st.session_state.generated_model = result
+            if result["compiles"]:
+                st.success("Model ready! Review and train below.")
 
     # ── Step 2: Review + Train ──
     if st.session_state.get("generated_model"):
@@ -501,12 +871,14 @@ elif screen == "4. Fine-Tune":
 
         if st.button("Train Generated Model", type="primary"):
             cols = list(cleaned.columns)
-            train_label_cols = label_cols if label_cols else None
+            # Validate all column references against actual dataframe columns
+            train_text_cols = [c for c in (text_cols or []) if c in cols]
+            train_label_cols = [c for c in (label_cols or []) if c in cols] if label_cols else None
+            if not train_text_cols:
+                train_text_cols = cols[:3] if not train_label_cols else [c for c in cols if c not in train_label_cols][:5]
             if train_label_cols:
-                train_text_cols = text_cols if text_cols else [c for c in cols if c not in train_label_cols]
                 train_df = cleaned[train_text_cols + train_label_cols].copy()
             else:
-                train_text_cols = text_cols if text_cols else cols
                 train_df = cleaned[train_text_cols].copy()
 
             st.session_state.train_log = [f"Training on {len(cleaned)} rows", f"Features: {train_text_cols}", f"Labels: {train_label_cols}"]
@@ -542,47 +914,84 @@ elif screen == "4. Fine-Tune":
                 st.success("Training complete!")
                 st.rerun()
             except Exception as e:
-                st.session_state.train_log.append(f"ERROR: {e}")
-                st.error(f"Training failed: {e}")
+                st.session_state.train_log.append(f"Generated model failed: {e}")
+                st.session_state.train_log.append("Falling back to data-matched model...")
+                try:
+                    fallback_code = _model_code_for_assessment(assessment) if assessment else _safe_model_code()
+                    tmp_dir2 = tempfile.mkdtemp(prefix="dataforge_fb_")
+                    fb_code_path = os.path.join(tmp_dir2, "fallback_model.py")
+                    with open(fb_code_path, "w") as f:
+                        f.write(fallback_code)
+                    fb_spec = importlib.util.spec_from_file_location("gen_model_fb", fb_code_path)
+                    fb_mod = importlib.util.module_from_spec(fb_spec)
+                    sys.modules["gen_model_fb"] = fb_mod
+                    fb_spec.loader.exec_module(fb_mod)
+                    model_instance = fb_mod.GeneratedModel()
+                    st.session_state.train_log.append("Fallback: training safe model...")
+                    model_instance.train(train_df, train_text_cols, train_label_cols)
+                    metrics = model_instance.evaluate(train_df, train_text_cols, train_label_cols)
+                    st.session_state.gen_metrics = metrics
+                    st.session_state.gen_model_instance = model_instance
+                    st.session_state.gen_model_module = fb_mod
+                    st.session_state.gen_model_code = fallback_code
+                    st.session_state.train_text_cols = train_text_cols
+                    st.session_state.train_label_cols = train_label_cols
+                    st.session_state.training = False
+                    task = assessment.get("task_type", "model").title() if assessment else "Model"
+                    st.warning(f"AI model had issues — {task} fallback model trained successfully instead.")
+                    st.session_state.train_log.append(f"{task} fallback model trained successfully.")
+                    st.rerun()
+                except Exception as e2:
+                    st.session_state.train_log.append(f"Fallback also failed: {e2}")
+                    st.error(f"Training failed. Please check your data: {e2}")
 
         # Show training log from session state
         if st.session_state.get("train_log"):
             with st.expander("Training Log", expanded=True):
-                st.code("\n".join(st.session_state.train_log))
+                try:
+                    st.code("\n".join(str(x) for x in st.session_state.train_log))
+                except Exception as e:
+                    st.caption(f"Log display unavailable: {e}")
 
         # Show trained model results
         if st.session_state.get("gen_metrics"):
             st.success("Your generated model has been trained!")
             st.subheader("Model Metrics")
-            metrics = st.session_state.gen_metrics
-            c1, c2, c3 = st.columns(3)
-            i = 0
-            for k, v in metrics.items():
-                if isinstance(v, float):
-                    with [c1, c2, c3][i % 3]:
-                        st.metric(k.replace("_", " ").title(), f"{v:.4f}")
-                    i += 1
-            for k, v in metrics.items():
-                if isinstance(v, dict) and k == "classification_report":
-                    with st.expander("Classification Report", expanded=False):
-                        st.json(v)
-                elif not isinstance(v, float):
-                    with st.expander(k.replace("_", " ").title(), expanded=False):
-                        st.write(v)
+            try:
+                metrics = st.session_state.gen_metrics
+                c1, c2, c3 = st.columns(3)
+                i = 0
+                for k, v in metrics.items():
+                    if isinstance(v, float):
+                        with [c1, c2, c3][i % 3]:
+                            st.metric(k.replace("_", " ").title(), f"{v:.4f}")
+                        i += 1
+                for k, v in metrics.items():
+                    if isinstance(v, dict) and k == "classification_report":
+                        with st.expander("Classification Report", expanded=False):
+                            st.json(v)
+                    elif not isinstance(v, float):
+                        with st.expander(k.replace("_", " ").title(), expanded=False):
+                            st.write(v)
+            except Exception as e:
+                st.caption(f"Metrics display error: {e}")
 
             # Model download (in-memory)
             if st.session_state.get("gen_model_instance"):
-                import io, joblib
-                buf = io.BytesIO()
-                joblib.dump(st.session_state.gen_model_instance, buf)
-                buf.seek(0)
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.download_button("Download Trained Model (.joblib)", buf, file_name="trained_model.joblib", use_container_width=True)
-                with col2:
-                    if st.button("Delete Model", type="secondary", use_container_width=True):
-                        clear_model_session_state()
-                        st.rerun()
+                try:
+                    import io, joblib
+                    buf = io.BytesIO()
+                    joblib.dump(st.session_state.gen_model_instance, buf)
+                    buf.seek(0)
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.download_button("Download Trained Model (.joblib)", buf, file_name="trained_model.joblib", use_container_width=True)
+                    with col2:
+                        if st.button("Delete Model", type="secondary", use_container_width=True):
+                            clear_model_session_state()
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"Model download failed: {e}")
 
         st.divider()
         st.subheader("Alternative: Fine-Tune an LLM Instead")
@@ -603,6 +1012,9 @@ elif screen == "4. Fine-Tune":
                 model_choice = st.selectbox("Model", list(AVAILABLE_MODELS.keys()))
                 num_epochs = st.slider("Epochs", 1, 3, 1)
                 jsonl_data = st.session_state.get("instruction_str") or st.session_state.get("chat_str")
+                if not jsonl_data:
+                    st.error("No formatted data found. Go to Screen 3 and generate JSONL first.")
+                    st.stop()
                 tmp_dir = Path(tempfile.mkdtemp(prefix="dataforge_"))
                 train_path = tmp_dir / "train_data.jsonl"
                 train_path.write_text(jsonl_data)
@@ -610,30 +1022,36 @@ elif screen == "4. Fine-Tune":
                 done_flag = tmp_dir / "train_done.flag"
 
                 if st.button("Start Fine-Tuning"):
-                    log_path.write_text("[0/4] Starting...\n")
-                    train_async(
-                        jsonl_path=str(train_path),
-                        model_name=model_choice,
-                        num_epochs=num_epochs,
-                        output_dir=str(tmp_dir / "model"),
-                        log_file=str(log_path),
-                    )
-                    st.rerun()
+                    try:
+                        log_path.write_text("[0/4] Starting...\n")
+                        train_async(
+                            jsonl_path=str(train_path),
+                            model_name=model_choice,
+                            num_epochs=num_epochs,
+                            output_dir=str(tmp_dir / "model"),
+                            log_file=str(log_path),
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Fine-tuning failed to start: {e}")
 
                 if log_path.exists():
-                    log_text = log_path.read_text()
-                    is_done = "__DONE__" in log_text
-                    if is_done:
-                        done_flag.touch()
-                        st.success("Training complete!")
-                    else:
-                        steps = sum(1 for l in log_text.split("\n") if "[0/4]" in l or "[1/4]" in l or "[2/4]" in l or "[3/4]" in l or "[4/4]" in l)
-                        st.progress(min(steps / 4, 0.99), text=f"Step {steps}/4")
-                        st.info("Training...")
-                        if st.button("🔄 Refresh"):
-                            st.rerun()
-                    with st.expander("Logs"):
-                        st.code(log_text)
+                    try:
+                        log_text = log_path.read_text()
+                        is_done = "__DONE__" in log_text
+                        if is_done:
+                            done_flag.touch()
+                            st.success("Training complete!")
+                        else:
+                            steps = sum(1 for l in log_text.split("\n") if "[0/4]" in l or "[1/4]" in l or "[2/4]" in l or "[3/4]" in l or "[4/4]" in l)
+                            st.progress(min(steps / 4, 0.99), text=f"Step {steps}/4")
+                            st.info("Training...")
+                            if st.button("🔄 Refresh"):
+                                st.rerun()
+                        with st.expander("Logs"):
+                            st.code(log_text)
+                    except Exception as e:
+                        st.caption(f"Log read error: {e}")
 
             elif approach == "Cloud (Together AI)":
                 if not TOGETHER_API_KEY:
@@ -642,6 +1060,9 @@ elif screen == "4. Fine-Tune":
                 cloud_model = st.selectbox("Base model", CLOUD_MODELS if CLOUD_MODELS else ["meta-llama/Meta-Llama-3.1-8B-Instruct"])
                 cloud_epochs = st.slider("Epochs", 1, 3, 1)
                 jsonl_data = st.session_state.get("instruction_str") or st.session_state.get("chat_str")
+                if not jsonl_data:
+                    st.error("No formatted data found. Go to Screen 3 and generate JSONL first.")
+                    st.stop()
                 tmp_file = tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False)
                 tmp_file.write(jsonl_data)
                 tmp_file.close()
@@ -663,14 +1084,20 @@ elif screen == "4. Fine-Tune":
                         clog(f"Done! Model: {result.get('output', {}).get('model', 'available')}")
                     except Exception as e:
                         clog(f"Error: {e}")
-                os.unlink(tmp_file.name)
+                try:
+                    os.unlink(tmp_file.name)
+                except Exception:
+                    pass
 
             else:
                 hf_dataset = st.text_input("HF dataset repo", placeholder="username/dataset")
                 colab_model = st.selectbox("Model", list(AVAILABLE_MODELS.keys()), key="colab_model")
                 if st.button("Generate Colab Notebook") and hf_dataset:
-                    nb = generate_colab_notebook(hf_dataset, AVAILABLE_MODELS[colab_model])
-                    st.download_button("Download Colab Notebook", nb.encode(), file_name="finetune_colab.ipynb")
+                    try:
+                        nb = generate_colab_notebook(hf_dataset, AVAILABLE_MODELS[colab_model])
+                        st.download_button("Download Colab Notebook", nb.encode(), file_name="finetune_colab.ipynb")
+                    except Exception as e:
+                        st.error(f"Colab notebook generation failed: {e}")
         else:
             st.info("Format your data on Screen 3 first to access LLM fine-tuning options.")
 
@@ -696,4 +1123,7 @@ elif screen == "5. Model Playground":
     text_cols = st.session_state.get("train_text_cols") or st.session_state.get("text_cols", [])
     label_cols = st.session_state.get("train_label_cols") or st.session_state.get("label_cols", [])
 
-    show_playground(cleaned, model_instance, model_module, model_code, text_cols, label_cols, GROQ_API_KEY, st.session_state.get("gen_metrics", {}))
+    try:
+        show_playground(cleaned, model_instance, model_module, model_code, text_cols, label_cols, GROQ_API_KEY, st.session_state.get("gen_metrics", {}))
+    except Exception as e:
+        st.error(f"Playground error: {e}")

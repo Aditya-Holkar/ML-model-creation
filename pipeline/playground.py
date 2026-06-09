@@ -215,6 +215,106 @@ def _run_bulk_predictions(model, df: pd.DataFrame, feature_names: list, has_labe
         return f"Bulk prediction failed: {e}"
 
 
+def _suggested_questions(df: pd.DataFrame, feature_names: list, label_cols: list, task_type: str, gen_metrics: dict = None, api_key: str = None) -> list:
+    data_summary = _build_data_context(df, feature_names, label_cols, task_type)
+
+    if api_key:
+        prompt = f"""You are a data analyst. Based on this dataset summary, generate exactly 3 concise prediction/insight questions that can be answered from the data.
+
+Dataset:
+{data_summary}
+
+Rules:
+- Each question must reference actual column names from the dataset
+- Each question must be answerable using the provided data + model
+- Focus on predictions, trends, what-if scenarios
+- Do NOT ask about clustering, correlations, or distributions
+- Do NOT ask about model internals or metrics
+- Do NOT include numbering or prefixes
+- Return one question per line, no extra text
+
+Examples of good questions:
+- What will the predicted price be for a house with 3 beds and 2000 sqft?
+- Will the customer default if their income is below $50k?
+- What happens to sales when the marketing spend doubles?"""
+        try:
+            import requests
+            resp = requests.post(
+                GROQ_API_URL,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": "llama-3.3-70b-versatile", "messages": [{"role": "user", "content": prompt}], "temperature": 0.3},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            text = resp.json()["choices"][0]["message"]["content"]
+            qs = [line.strip().strip('"').strip("'") for line in text.strip().split("\n") if line.strip() and not line.strip().startswith(("- ", "•", "1.", "2.", "3."))]
+            if len(qs) >= 3:
+                return qs[:6]
+        except Exception:
+            pass
+
+    # Fallback: data-driven template questions
+    questions = []
+    num_feats = [c for c in feature_names if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+    cat_feats = [c for c in feature_names if c in df.columns and not pd.api.types.is_numeric_dtype(df[c])]
+
+    def _val(col, stat):
+        try: return round(float(getattr(df[col], stat)()), 1) if col in df.columns and pd.api.types.is_numeric_dtype(df[col]) else None
+        except: return None
+
+    label = label_cols[0] if label_cols else "target"
+
+    if task_type == "classification":
+        if num_feats:
+            f = num_feats[0]
+            lo, hi = _val(f, "min"), _val(f, "max")
+            if lo is not None:
+                questions.append(f"Will {label} be positive if {f} is high (near {hi})?")
+                questions.append(f"Predict {label} when {f} = {(lo + hi) / 2:.1f}")
+        if len(num_feats) >= 2:
+            f1, f2 = num_feats[0], num_feats[1]
+            lo1, hi1 = _val(f1, "min"), _val(f1, "max")
+            lo2, hi2 = _val(f2, "min"), _val(f2, "max")
+            if all(v is not None for v in [lo1, hi1, lo2, hi2]):
+                questions.append(f"What happens to {label} when {f1} = {hi1} and {f2} = {lo2}?")
+        if cat_feats:
+            vals = df[cat_feats[0]].dropna().unique()[:3]
+            if len(vals) > 0:
+                questions.append(f"Predict {label} for {cat_feats[0]} = {str(vals[0])}")
+        if gen_metrics and gen_metrics.get("accuracy"):
+            questions.append(f"The model is {gen_metrics['accuracy']*100:.0f}% accurate — predict {label} for the next row")
+    elif task_type == "regression":
+        if num_feats:
+            f = num_feats[0]
+            lo, hi, med = _val(f, "min"), _val(f, "max"), _val(f, "median")
+            if lo is not None and hi is not None and med is not None:
+                questions.append(f"Forecast {label} if {f} rises to {hi}")
+                questions.append(f"Predict {label} when {f} is at typical level ({med})")
+        if len(num_feats) >= 2:
+            f1, f2 = num_feats[0], num_feats[1]
+            hi1, hi2 = _val(f1, "max"), _val(f2, "max")
+            if hi1 is not None and hi2 is not None:
+                questions.append(f"What will {label} be if {f1} = {hi1} and {f2} = {hi2}?")
+        if gen_metrics and gen_metrics.get("r2_score"):
+            questions.append(f"Predict {label} for a new row and explain the result")
+    else:
+        if num_feats:
+            f = num_feats[0]
+            lo, hi = _val(f, "min"), _val(f, "max")
+            if lo is not None and hi is not None:
+                questions.append(f"Predict the outcome when {f} is between {lo} and {hi}")
+
+    questions.append(f"Make a prediction using the latest data and explain the result")
+
+    seen = set()
+    unique = []
+    for q in questions:
+        if q not in seen:
+            seen.add(q)
+            unique.append(q)
+    return unique[:6]
+
+
 def show_chat_tab(api_key: str, df: pd.DataFrame, model, module, feature_names: list, label_cols: list, task_type: str, has_labels: bool, gen_metrics: dict = None):
     data_context = _build_data_context(df, feature_names, label_cols, task_type)
     model_context = _build_model_context(model, feature_names, has_labels, task_type, gen_metrics)
@@ -246,12 +346,7 @@ Your job:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"])
 
-    question = st.chat_input("Ask about your data or model...")
-    if question:
-        st.session_state.chat_messages.append({"role": "user", "content": question})
-        with st.chat_message("user"):
-            st.markdown(question)
-
+    def _answer_question(question):
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 pred_info = ""
@@ -290,6 +385,34 @@ Your job:
                                 st.code(json.dumps(flat, indent=2))
                     st.session_state._last_pred = None
                 st.session_state.chat_messages.append({"role": "assistant", "content": reply})
+
+    # Process a pending suggestion from a button click
+    pending = st.session_state.pop("_pending_suggestion", None)
+    if pending:
+        st.session_state.chat_messages.append({"role": "user", "content": pending})
+        with st.chat_message("user"):
+            st.markdown(pending)
+        _answer_question(pending)
+
+    # Suggested questions as clickable chips
+    suggestions = _suggested_questions(df, feature_names, label_cols, task_type, gen_metrics, api_key)
+    if suggestions and len(st.session_state.chat_messages) == 0:
+        st.caption("Try asking:")
+        ncols = min(3, len(suggestions))
+        for i in range(0, len(suggestions), ncols):
+            row = suggestions[i:i + ncols]
+            cols = st.columns(ncols)
+            for j, sq in enumerate(row):
+                if cols[j].button(sq, key=f"sq_{i + j}", use_container_width=True):
+                    st.session_state._pending_suggestion = sq
+                    st.rerun()
+
+    question = st.chat_input("Ask about your data or model...")
+    if question:
+        st.session_state.chat_messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        _answer_question(question)
 
     if st.button("Clear Chat History"):
         st.session_state.chat_messages = []

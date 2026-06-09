@@ -3,7 +3,7 @@ import pandas as pd
 
 
 def _concat_cols(row, cols, sep="\n"):
-    parts = [str(row[c]) for c in cols]
+    parts = [str(row[c]) for c in cols if c in row.index]
     return sep.join(parts)
 
 
