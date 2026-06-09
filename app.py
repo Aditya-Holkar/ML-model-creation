@@ -35,6 +35,40 @@ def clear_model_session_state():
         if k in st.session_state:
             del st.session_state[k]
 
+def _quick_demo_code():
+    return '''import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, classification_report
+
+class GeneratedModel:
+    def __init__(self):
+        self.model = RandomForestClassifier(n_estimators=100, random_state=42)
+
+    def train(self, df, text_cols, label_cols):
+        X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
+        y = df[label_cols[0]] if label_cols else None
+        if y is not None:
+            self.model.fit(X, y)
+        else:
+            self.model.fit(X)
+
+    def predict(self, df, text_cols):
+        X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
+        return self.model.predict(X)
+
+    def evaluate(self, df, text_cols, label_cols):
+        X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
+        y = df[label_cols[0]] if label_cols else None
+        if y is None:
+            return {"note": "No labels provided for evaluation"}
+        preds = self.model.predict(X)
+        return {
+            "accuracy": round(accuracy_score(y, preds), 4),
+            "classification_report": classification_report(y, preds, output_dict=True, zero_division=0),
+        }
+'''
+
 
 AVAILABLE_MODELS = {
     "TinyLlama-1.1B": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -359,46 +393,88 @@ elif screen == "4. Fine-Tune":
     text_cols = st.session_state.get("text_cols", [])
     label_cols = st.session_state.get("label_cols", [])
 
-    if not GROQ_API_KEY:
-        st.error("GROQ_API_KEY not found in .env file. Add it and restart.")
-        st.stop()
+    has_groq = bool(GROQ_API_KEY)
+    if not has_groq:
+        with st.warning("GROQ_API_KEY not set — AI generation disabled. Enter model code manually below."):
+            st.caption("Set `GROQ_API_KEY` in `.env` to enable AI suggestion & code generation.")
 
     # ── Step 1: Describe → Generate Code ──
-    st.subheader("Step 1: Describe What You Want")
-    st.caption("Describe your ML goal. DataForge generates a real Python model for your data.")
+    st.subheader("Step 1: Describe or Paste Your Model Code")
 
-    model_desc = st.text_area(
-        "What should your model do?",
-        value=st.session_state.get("model_desc_input", ""),
-        placeholder="e.g. Predict house prices from features\n"
-                    "or: Classify customer feedback as positive/negative\n"
-                    "or: Cluster customers into segments",
-        height=120,
-    )
-    st.session_state.model_desc_input = model_desc
+    if has_groq:
+        st.caption("Describe your ML goal. DataForge generates a real Python model for your data.")
+        model_desc = st.text_area(
+            "What should your model do?",
+            value=st.session_state.get("model_desc_input", ""),
+            placeholder="e.g. Predict house prices from features\n"
+                        "or: Classify customer feedback as positive/negative\n"
+                        "or: Cluster customers into segments",
+            height=120,
+        )
+        st.session_state.model_desc_input = model_desc
 
-    df_info = {
-        "columns": list(cleaned.columns),
-        "dtypes": {c: str(cleaned[c].dtype) for c in cleaned.columns},
-        "sample": {c: cleaned[c].dropna().head(5).tolist() for c in cleaned.columns[:5]},
-    }
+        df_info = {
+            "columns": list(cleaned.columns),
+            "dtypes": {c: str(cleaned[c].dtype) for c in cleaned.columns},
+            "sample": {c: cleaned[c].dropna().head(5).tolist() for c in cleaned.columns[:5]},
+        }
 
-    if st.button("🤖 Suggest Model (AI Advice)") and model_desc:
-        with st.spinner("Analyzing your data and goal..."):
-            try:
-                advice = suggest_model(model_desc, df_info, GROQ_API_KEY)
-                st.session_state.model_desc_input = advice
-                st.session_state.model_advice = advice
+        if st.button("🤖 Suggest Model (AI Advice)", disabled=not model_desc) and model_desc:
+            with st.spinner("Analyzing your data and goal..."):
+                try:
+                    advice = suggest_model(model_desc, df_info, GROQ_API_KEY)
+                    st.session_state.model_desc_input = advice
+                    st.session_state.model_advice = advice
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Suggestion failed: {e}")
+
+        if st.session_state.get("model_advice"):
+            with st.container(border=True):
+                st.markdown("**AI Recommendation — now in the text box above. Review and edit it, then click Generate Model Code.**")
+                st.caption(st.session_state.model_advice)
+
+        gen_btn = st.button("⚡ Generate Model Code", type="primary", disabled=not model_desc)
+    else:
+        st.caption("Paste your sklearn model code below, or use the quick template.")
+        model_desc = ""
+        gen_btn = False
+
+    # Manual code editor (shown when no API key, or after generation)
+    if not has_groq:
+        DEFAULT_TEMPLATE = """# Paste your sklearn model code here.
+# It must define a class with train() and evaluate() methods.
+# Example:
+# from sklearn.ensemble import RandomForestClassifier
+# from sklearn.metrics import accuracy_score
+#
+# class GeneratedModel:
+#     def train(self, df, text_cols, label_cols):
+#         ...
+#     def evaluate(self, df, text_cols, label_cols):
+#         ...
+"""
+        manual_code = st.text_area("Model Code (Python)", value=st.session_state.get("manual_code", DEFAULT_TEMPLATE), height=300)
+        st.session_state.manual_code = manual_code
+
+        col_a, col_b = st.columns(2)
+        with col_a:
+            apply_btn = st.button("Use This Code", type="primary")
+        with col_b:
+            if st.button("Use Iris Classifier (Quick Demo)"):
+                st.session_state.manual_code = _quick_demo_code()
                 st.rerun()
-            except Exception as e:
-                st.error(f"Suggestion failed: {e}")
 
-    if st.session_state.get("model_advice"):
-        with st.container(border=True):
-            st.markdown("**AI Recommendation — now in the text box above. Review and edit it, then click Generate Model Code.**")
-            st.caption(st.session_state.model_advice)
+        if apply_btn and manual_code.strip():
+            try:
+                compile(manual_code, "<manual>", "exec")
+                result = {"model_path": None, "code": manual_code, "compiles": True}
+                st.session_state.generated_model = result
+                st.success("Code verified and applied!")
+            except SyntaxError as e:
+                st.error(f"Syntax error: {e}")
 
-    if st.button("⚡ Generate Model Code", type="primary") and model_desc:
+    if gen_btn and model_desc:
         with st.spinner("Generating custom ML model code..."):
             try:
                 result = generate_model(model_desc, df_info, GROQ_API_KEY)
