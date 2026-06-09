@@ -1,0 +1,11 @@
+# API keys
+.env
+.env.local
+
+# Output files
+output/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

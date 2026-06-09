@@ -1,0 +1,5 @@
+# Core pipeline
+-r requirements-core.txt
+
+# Optional: uncomment for fine-tuning
+# -r requirements-finetune.txt
