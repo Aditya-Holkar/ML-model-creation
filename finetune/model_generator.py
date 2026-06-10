@@ -76,6 +76,32 @@ class GeneratedModel:
         self.model = __MODEL_PLACEHOLDER__
         self.metric_type = "__METRIC_TYPE__"
         self.feature_names_ = None
+        self._data_stats = None
+
+    def _compute_stats(self, df, cols):
+        stats = {}
+        for c in cols:
+            if c not in df.columns:
+                continue
+            if pd.api.types.is_numeric_dtype(df[c]):
+                stats[c] = {"dtype": "numeric", "median": float(df[c].median()) if not df[c].isna().all() else 0.0}
+            else:
+                mode_vals = df[c].dropna().mode()
+                stats[c] = {"dtype": "categorical", "mode": str(mode_vals.iloc[0]) if len(mode_vals) > 0 else ""}
+        return stats
+
+    def _auto_fill(self, X):
+        if self._data_stats is None:
+            return X
+        for c, stat in self._data_stats.items():
+            if c not in X.columns:
+                X[c] = stat.get("median") if stat["dtype"] == "numeric" else stat.get("mode", "")
+            else:
+                idx = X[c].isna()
+                if idx.any():
+                    fill_val = stat.get("median") if stat["dtype"] == "numeric" else stat.get("mode", "")
+                    X.loc[idx, c] = fill_val
+        return X
 
     def train(self, df, text_cols, label_cols):
         if label_cols and len(label_cols) > 0:
@@ -90,6 +116,7 @@ class GeneratedModel:
         else:
             X = df[text_cols].copy() if text_cols else df.copy(); y = None
         self.feature_names_ = X.columns.tolist()
+        self._data_stats = self._compute_stats(df, self.feature_names_)
         Xp = self.preprocessor.fit_transform(X)
         if y is not None:
             self.model.fit(Xp, y)
@@ -106,6 +133,7 @@ class GeneratedModel:
     def predict(self, X):
         if isinstance(X, dict):
             X = pd.DataFrame([X])
+        X = self._auto_fill(X)
         return self.model.predict(self.preprocessor.transform(X[self.feature_names_]))
 
     def evaluate(self, df, text_cols, label_cols):
@@ -147,8 +175,8 @@ def _get_data_info(df_info: dict) -> str:
 
 
 _DEFAULT_MODELS = {
-    "classify": "RandomForestClassifier(n_estimators=100, random_state=42)",
-    "regress": "LinearRegression()",
+    "classify": "RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)",
+    "regress": "RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)",
     "cluster": "KMeans(n_clusters=3, random_state=42, n_init=10)",
 }
 
