@@ -103,9 +103,9 @@ class GeneratedModel:
         Xp = self.preprocessor.fit_transform(X)
         if y is not None:
             if y.dtype.kind in ("O",) or y.nunique() < 20:
-                self.model = RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)
+                self.model = RandomForestClassifier(n_estimators=100, max_depth=10, n_jobs=-1, random_state=42)
             else:
-                self.model = RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)
+                self.model = RandomForestRegressor(n_estimators=100, max_depth=10, n_jobs=-1, random_state=42)
             self.model.fit(Xp, y)
         else:
             n = min(3, len(Xp))
@@ -766,7 +766,10 @@ elif screen == "4. Fine-Tune":
         st.divider()
         st.subheader("Step 3: Train This Model on Your Data")
 
-        if st.button("Train Generated Model", type="primary"):
+        # ── Retrain-on-full-data trigger (must check before the button to consume the flag) ──
+        _retrain_requested = st.session_state.pop("_retrain_full", False)
+
+        if st.button("Train Generated Model", type="primary") or _retrain_requested:
             # Deduplicate column names (e.g. after snake_case rename)
             if cleaned.columns.duplicated().any():
                 cleaned = cleaned.loc[:, ~cleaned.columns.duplicated(keep="first")]
@@ -778,7 +781,7 @@ elif screen == "4. Fine-Tune":
             if not train_text_cols:
                 st.error("No feature columns remaining after excluding labels.")
                 st.stop()
-            # Build target list: if all columns are labels, train one model per column
+            # Build target list
             if train_label_cols and len(train_label_cols) >= len(cols) - 1:
                 target_columns = train_label_cols[:]
             elif train_label_cols:
@@ -786,73 +789,101 @@ elif screen == "4. Fine-Tune":
             else:
                 target_columns = []
 
-            st.session_state.train_log = [f"Training on {len(cleaned)} rows"]
+            # ── Auto-sampling ──
+            SAMPLE_THRESHOLD = 5000
+            using_sample = len(cleaned) > SAMPLE_THRESHOLD and not _retrain_requested
+            train_df = cleaned.sample(n=SAMPLE_THRESHOLD, random_state=42) if using_sample else cleaned
+            feature_cols = [c for c in train_text_cols if c not in target_columns] or train_text_cols[:10]
 
-            def _train_single_target(code_template, target_col, all_cols, log_list):
-                feats = [c for c in all_cols if c != target_col][:10]
-                tdf = cleaned[feats + [target_col]].copy()
-                ns = {}
-                exec(compile(code_template, "<model>", "exec"), ns)
-                inst = ns["GeneratedModel"]()
-                log_list.append(f"  Training {target_col} ({len(feats)} features)...")
-                inst.train(tdf, feats, [target_col])
-                m = inst.evaluate(tdf, feats, [target_col])
-                log_list.append(f"  {target_col} done")
-                for k, v in m.items():
-                    if isinstance(v, (int, float)):
-                        log_list.append(f"  → {target_col} {k}: {v:.4f}")
-                return target_col, {"model": inst, "features": feats, "metrics": m}
-
-            ensemble = {}
-            all_metrics = {}
+            st.session_state.train_log = [f"Training on {len(train_df)} rows" + (" (5K sample)" if using_sample else "")]
             train_log = []
 
-            try:
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                with ThreadPoolExecutor(max_workers=min(8, len(target_columns) or 1)) as ex:
-                    fut_to_target = {ex.submit(_train_single_target, result["code"], t, cols, train_log): t for t in target_columns}
-                    for f in as_completed(fut_to_target):
-                        t, r = f.result()
-                        ensemble[t] = r
-                        all_metrics[t] = r["metrics"]
+            def _log(msg):
+                train_log.append(msg)
+                st.session_state.train_log = train_log[:]
 
-                st.session_state.train_log.extend(train_log)
-                st.session_state.gen_model_ensemble = ensemble
-                st.session_state.gen_model_instance = list(ensemble.values())[0]["model"]
-                st.session_state.gen_model_module = None
-                st.session_state.gen_model_code = result["code"]
-                st.session_state.gen_metrics = all_metrics
-                st.session_state.train_text_cols = train_text_cols
-                st.session_state.train_label_cols = train_label_cols
-                st.session_state.training = False
-                st.success(f"Trained {len(ensemble)} models! Use the Playground to ask about any column.")
-                st.rerun()
-            except Exception as e:
-                st.session_state.train_log.append(f"Generated model ensemble failed: {e}")
-                st.session_state.train_log.append("Falling back to universal template...")
-                train_log = []
+            def _compute_metrics(y_true, y_pred, model_name):
+                from sklearn.metrics import accuracy_score, r2_score, classification_report, mean_squared_error
+                name = model_name.lower()
+                if "classifier" in name or "svc" in name:
+                    return {"accuracy": round(accuracy_score(y_true, y_pred), 4), "classification_report": classification_report(y_true, y_pred, output_dict=True, zero_division=0)}
+                if "regressor" in name or "svr" in name or "regression" in name:
+                    return {"r2_score": round(r2_score(y_true, y_pred), 4), "mse": round(mean_squared_error(y_true, y_pred), 4)}
+                return {}
+
+            def _ensure_n_jobs(model):
                 try:
-                    from concurrent.futures import ThreadPoolExecutor, as_completed
-                    with ThreadPoolExecutor(max_workers=min(8, len(target_columns) or 1)) as ex:
-                        fut_to_target = {ex.submit(_train_single_target, _UNIVERSAL_TEMPLATE, t, cols, train_log): t for t in target_columns}
-                        for f in as_completed(fut_to_target):
-                            t, r = f.result()
-                            ensemble[t] = r
-                            all_metrics[t] = r["metrics"]
-                    st.session_state.train_log.extend(train_log)
-                    st.session_state.gen_model_ensemble = ensemble
-                    st.session_state.gen_model_instance = list(ensemble.values())[0]["model"]
-                    st.session_state.gen_model_module = None
-                    st.session_state.gen_model_code = _UNIVERSAL_TEMPLATE
-                    st.session_state.train_text_cols = train_text_cols
-                    st.session_state.train_label_cols = train_label_cols
-                    st.session_state.training = False
-                    st.warning(f"AI model had issues — fallback ensemble trained successfully instead.")
-                    st.session_state.train_log.append("Fallback ensemble trained successfully.")
-                    st.rerun()
+                    model.set_params(n_jobs=-1)
+                except (ValueError, TypeError):
+                    pass
+                return model
+
+            def _train_ensemble(code_template):
+                _log("Compiling model code...")
+                ns = {}
+                exec(compile(code_template, "<model>", "exec"), ns)
+                ModelClass = ns["GeneratedModel"]
+
+                proto = ModelClass()
+                X_all = train_df[feature_cols]
+                _log("Fitting preprocessor...")
+                proto.preprocessor.fit(X_all)
+
+                ensemble = {}
+                all_metrics = {}
+                final_code = code_template
+
+                for i, target in enumerate(target_columns):
+                    _log(f"Training model {i+1}/{len(target_columns)}: {target}")
+                    inst = ModelClass()
+                    inst.preprocessor = proto.preprocessor
+                    Xp = inst.preprocessor.transform(X_all)
+                    y = train_df[target].ffill().bfill().fillna(0)
+                    if y.dtype.kind == "b":
+                        y = y.astype(int)
+                    _ensure_n_jobs(inst.model)
+                    inst.model.fit(Xp, y)
+                    y_pred = inst.model.predict(Xp)
+                    metrics = _compute_metrics(y, y_pred, type(inst.model).__name__)
+                    all_metrics[target] = metrics
+                    inst.feature_names_ = feature_cols
+                    ensemble[target] = {"model": inst, "features": feature_cols, "metrics": metrics}
+                    _log(f"  {target} done")
+
+                return ensemble, all_metrics, final_code
+
+            used_code = result["code"]
+            try:
+                ensemble, all_metrics, used_code = _train_ensemble(used_code)
+            except Exception as e:
+                _log(f"Generated model failed: {e}")
+                _log("Falling back to universal template...")
+                try:
+                    ensemble, all_metrics, used_code = _train_ensemble(_UNIVERSAL_TEMPLATE)
+                    st.warning("AI model had issues — universal template trained instead.")
                 except Exception as e2:
-                    st.session_state.train_log.append(f"Fallback also failed: {e2}")
-                    st.error(f"Training failed. Please check your data: {e2}")
+                    _log(f"Fallback also failed: {e2}")
+                    st.error(f"Training failed: {e2}")
+                    st.stop()
+
+            st.session_state.gen_model_ensemble = ensemble
+            st.session_state.gen_model_instance = list(ensemble.values())[0]["model"]
+            st.session_state.gen_model_module = None
+            st.session_state.gen_model_code = used_code
+            st.session_state.gen_metrics = all_metrics
+            st.session_state.train_text_cols = feature_cols
+            st.session_state.train_label_cols = target_columns
+            st.session_state._sampled_training = using_sample
+            st.session_state.training = False
+            st.success(f"Trained {len(ensemble)} model{'s' if len(ensemble) != 1 else ''}! Use the Playground to ask about any column.")
+            st.rerun()
+
+        # ── Retrain-on-full-data button (shown after sampled training) ──
+        if st.session_state.get("_sampled_training") and not st.session_state.get("_retrain_full"):
+            st.info("Trained on a 5K-row sample for speed.")
+            if st.button("Train on Full Dataset (more accurate)", type="primary"):
+                st.session_state._retrain_full = True
+                st.rerun()
 
         # Show training log from session state
         if st.session_state.get("train_log"):

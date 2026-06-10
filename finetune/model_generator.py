@@ -175,8 +175,8 @@ def _get_data_info(df_info: dict) -> str:
 
 
 _DEFAULT_MODELS = {
-    "classify": "RandomForestClassifier(n_estimators=50, max_depth=10, random_state=42)",
-    "regress": "RandomForestRegressor(n_estimators=50, max_depth=10, random_state=42)",
+    "classify": "RandomForestClassifier(n_estimators=100, max_depth=10, n_jobs=-1, random_state=42)",
+    "regress": "RandomForestRegressor(n_estimators=100, max_depth=10, n_jobs=-1, random_state=42)",
     "cluster": "KMeans(n_clusters=3, random_state=42, n_init=10)",
 }
 
