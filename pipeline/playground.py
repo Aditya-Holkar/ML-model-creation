@@ -197,6 +197,22 @@ def _is_prediction_question(question: str) -> bool:
     return any(kw in q for kw in keywords)
 
 
+def _detect_target_column(question: str, all_columns: list, trained_label: str = None) -> str | None:
+    q = question.lower()
+    for col in all_columns:
+        col_lower = col.lower()
+        patterns = [
+            rf"predict\s+{re.escape(col_lower)}",
+            rf"forecast\s+{re.escape(col_lower)}",
+            rf"what (?:is|will be|would be)\s+(?:the\s+)?{re.escape(col_lower)}",
+            rf"{re.escape(col_lower)}\s+(?:of|for|when|if)",
+            rf"estimate\s+{re.escape(col_lower)}",
+        ]
+        if any(re.search(p, q) for p in patterns):
+            return col
+    return trained_label
+
+
 def _run_bulk_predictions(model, df: pd.DataFrame, feature_names: list, has_labels: bool, max_rows: int = 50) -> str:
     try:
         X = df[feature_names].head(max_rows)
@@ -215,21 +231,25 @@ def _run_bulk_predictions(model, df: pd.DataFrame, feature_names: list, has_labe
         return f"Bulk prediction failed: {e}"
 
 
-def _suggested_questions(df: pd.DataFrame, feature_names: list, label_cols: list, task_type: str, gen_metrics: dict = None, api_key: str = None) -> list:
+def _suggested_questions(df: pd.DataFrame, feature_names: list, label_cols: list, task_type: str, gen_metrics: dict = None, api_key: str = None, model_ensemble: dict = None) -> list:
     data_summary = _build_data_context(df, feature_names, label_cols, task_type)
 
+    predict_targets = list(model_ensemble.keys()) if model_ensemble else ([label_cols[0]] if label_cols else ["target"])
+    targets_str = ", ".join(predict_targets)
     if api_key:
-        prompt = f"""You are a data analyst. Based on this dataset summary, generate exactly 3 concise prediction/insight questions that can be answered from the data.
+        prompt = f"""You are a data analyst. Based on this dataset summary, generate exactly 3 concise prediction questions that can be answered from the data.
 
 Dataset:
 {data_summary}
 
+The ML model can predict these columns: {targets_str}.
+Ask about DIFFERENT prediction targets in each question.
+
 Rules:
 - Each question must reference actual column names from the dataset
-- Each question must be answerable using the provided data + model
-- Focus on predictions, trends, what-if scenarios
+- Each question must ask to predict a DIFFERENT column from the list: {targets_str}
+- Focus on predictions, what-if scenarios
 - Do NOT ask about clustering, correlations, or distributions
-- Do NOT ask about model internals or metrics
 - Do NOT include numbering or prefixes
 - Return one question per line, no extra text
 
@@ -262,49 +282,65 @@ Examples of good questions:
         try: return round(float(getattr(df[col], stat)()), 1) if col in df.columns and pd.api.types.is_numeric_dtype(df[col]) else None
         except: return None
 
-    label = label_cols[0] if label_cols else "target"
-
-    if task_type == "classification":
-        if num_feats:
-            f = num_feats[0]
-            lo, hi = _val(f, "min"), _val(f, "max")
-            if lo is not None:
-                questions.append(f"Will {label} be positive if {f} is high (near {hi})?")
-                questions.append(f"Predict {label} when {f} = {(lo + hi) / 2:.1f}")
-        if len(num_feats) >= 2:
-            f1, f2 = num_feats[0], num_feats[1]
-            lo1, hi1 = _val(f1, "min"), _val(f1, "max")
-            lo2, hi2 = _val(f2, "min"), _val(f2, "max")
-            if all(v is not None for v in [lo1, hi1, lo2, hi2]):
-                questions.append(f"What happens to {label} when {f1} = {hi1} and {f2} = {lo2}?")
-        if cat_feats:
-            vals = df[cat_feats[0]].dropna().unique()[:3]
-            if len(vals) > 0:
-                questions.append(f"Predict {label} for {cat_feats[0]} = {str(vals[0])}")
-        if gen_metrics and gen_metrics.get("accuracy"):
-            questions.append(f"The model is {gen_metrics['accuracy']*100:.0f}% accurate — predict {label} for the next row")
-    elif task_type == "regression":
-        if num_feats:
-            f = num_feats[0]
-            lo, hi, med = _val(f, "min"), _val(f, "max"), _val(f, "median")
-            if lo is not None and hi is not None and med is not None:
-                questions.append(f"Forecast {label} if {f} rises to {hi}")
-                questions.append(f"Predict {label} when {f} is at typical level ({med})")
-        if len(num_feats) >= 2:
-            f1, f2 = num_feats[0], num_feats[1]
-            hi1, hi2 = _val(f1, "max"), _val(f2, "max")
-            if hi1 is not None and hi2 is not None:
-                questions.append(f"What will {label} be if {f1} = {hi1} and {f2} = {hi2}?")
-        if gen_metrics and gen_metrics.get("r2_score"):
-            questions.append(f"Predict {label} for a new row and explain the result")
+    # Generate one question per predict target when ensemble exists
+    if model_ensemble:
+        for label in list(model_ensemble.keys())[:5]:
+            feats = model_ensemble[label].get("features", [])
+            num_f = [c for c in feats if c in df.columns and pd.api.types.is_numeric_dtype(df[c])]
+            cat_f = [c for c in feats if c in df.columns and not pd.api.types.is_numeric_dtype(df[c])]
+            if num_f:
+                f = num_f[0]
+                lo, hi = _val(f, "min"), _val(f, "max")
+                if lo is not None:
+                    questions.append(f"Predict {label} when {f} = {(lo + hi) / 2:.1f}")
+            if cat_f:
+                vals = df[cat_f[0]].dropna().unique()[:3]
+                if len(vals) > 0:
+                    questions.append(f"What is the {label} for {cat_f[0]} = {str(vals[0])}?")
+            if len(questions) >= 6:
+                break
     else:
-        if num_feats:
-            f = num_feats[0]
-            lo, hi = _val(f, "min"), _val(f, "max")
-            if lo is not None and hi is not None:
-                questions.append(f"Predict the outcome when {f} is between {lo} and {hi}")
-
-    questions.append(f"Make a prediction using the latest data and explain the result")
+        label = label_cols[0] if label_cols else "target"
+        if task_type == "classification":
+            if num_feats:
+                f = num_feats[0]
+                lo, hi = _val(f, "min"), _val(f, "max")
+                if lo is not None:
+                    questions.append(f"Will {label} be positive if {f} is high (near {hi})?")
+                    questions.append(f"Predict {label} when {f} = {(lo + hi) / 2:.1f}")
+            if len(num_feats) >= 2:
+                f1, f2 = num_feats[0], num_feats[1]
+                lo1, hi1 = _val(f1, "min"), _val(f1, "max")
+                lo2, hi2 = _val(f2, "min"), _val(f2, "max")
+                if all(v is not None for v in [lo1, hi1, lo2, hi2]):
+                    questions.append(f"What happens to {label} when {f1} = {hi1} and {f2} = {lo2}?")
+            if cat_feats:
+                vals = df[cat_feats[0]].dropna().unique()[:3]
+                if len(vals) > 0:
+                    questions.append(f"Predict {label} for {cat_feats[0]} = {str(vals[0])}")
+            if gen_metrics and gen_metrics.get("accuracy"):
+                questions.append(f"The model is {gen_metrics['accuracy']*100:.0f}% accurate — predict {label} for the next row")
+        elif task_type == "regression":
+            if num_feats:
+                f = num_feats[0]
+                lo, hi, med = _val(f, "min"), _val(f, "max"), _val(f, "median")
+                if lo is not None and hi is not None and med is not None:
+                    questions.append(f"Forecast {label} if {f} rises to {hi}")
+                    questions.append(f"Predict {label} when {f} is at typical level ({med})")
+            if len(num_feats) >= 2:
+                f1, f2 = num_feats[0], num_feats[1]
+                hi1, hi2 = _val(f1, "max"), _val(f2, "max")
+                if hi1 is not None and hi2 is not None:
+                    questions.append(f"What will {label} be if {f1} = {hi1} and {f2} = {hi2}?")
+            if gen_metrics and gen_metrics.get("r2_score"):
+                questions.append(f"Predict {label} for a new row and explain the result")
+        else:
+            if num_feats:
+                f = num_feats[0]
+                lo, hi = _val(f, "min"), _val(f, "max")
+                if lo is not None and hi is not None:
+                    questions.append(f"Predict the outcome when {f} is between {lo} and {hi}")
+        questions.append(f"Make a prediction using the latest data and explain the result")
 
     seen = set()
     unique = []
@@ -315,11 +351,13 @@ Examples of good questions:
     return unique[:6]
 
 
-def show_chat_tab(api_key: str, df: pd.DataFrame, model, module, feature_names: list, label_cols: list, task_type: str, has_labels: bool, gen_metrics: dict = None):
+def show_chat_tab(api_key: str, df: pd.DataFrame, model, module, feature_names: list, label_cols: list, task_type: str, has_labels: bool, gen_metrics: dict = None, model_ensemble: dict = None):
     data_context = _build_data_context(df, feature_names, label_cols, task_type)
     model_context = _build_model_context(model, feature_names, has_labels, task_type, gen_metrics)
 
-    system_prompt = f"""You are a data scientist assistant. You have access to a trained ML model and its dataset.
+    ensemble_targets = list(model_ensemble.keys()) if model_ensemble else ([label_cols[0]] if label_cols else [])
+    targets_str = ", ".join(ensemble_targets)
+    system_prompt = f"""You are a data scientist assistant. You have access to a trained ML model ensemble and the full dataset.
 
 DATA CONTEXT:
 {data_context}
@@ -327,14 +365,17 @@ DATA CONTEXT:
 MODEL CONTEXT:
 {model_context}
 
+The ML ensemble can predict these columns: **{targets_str}**.
+When the user asks about predicting ANY of these columns, the system will AUTOMATICALLY run the correct model and provide the prediction result below. Reference that result in your answer.
+
 Your job:
 1. Answer questions about the data — trends, patterns, distributions, correlations.
 2. Answer questions about the model — how it works, what features matter most, how to interpret predictions.
-3. When the user asks "what if" or "predict" questions, the system will AUTOMATICALLY run the model and provide the prediction result below. Reference that result in your answer.
-4. **Highlight key numbers and insights in bold.** For example: "The model predicts **$52,340** with **87%** confidence."
-5. If the model has performance metrics (accuracy, R², MSE), reference them when relevant: "The model achieves **94%** accuracy on training data."
-6. Give clear, actionable insights. Use numbers and cite specific values from the data.
-7. If the user asks something you cannot answer from the data or model, say so honestly."""
+3. When the user asks a "predict" or "what if" question, the system runs the matching model and provides the prediction below. Always reference that result.
+4. **Highlight key numbers in bold.** Example: "The model predicts **₹52,340** for Rate_per_SqFt."
+5. If the model has performance metrics (accuracy, R², MSE), reference them: "The model achieves R² of **0.87** on training data."
+6. Give clear, actionable insights with numbers from the data.
+7. If you cannot answer from the data or model, say so honestly."""
 
     if "chat_messages" not in st.session_state:
         st.session_state.chat_messages = []
@@ -350,21 +391,34 @@ Your job:
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
                 pred_info = ""
-                inp = _try_extract_prediction_inputs(question, feature_names, df)
+                target_col = _detect_target_column(question, list(df.columns), label_cols[0] if label_cols else None)
+                # Pick the right model from the ensemble (or fall back to primary)
+                used_model = model
+                used_features = feature_names
+                used_label = label_cols[0] if label_cols else None
+                if model_ensemble and target_col and target_col in model_ensemble:
+                    entry = model_ensemble[target_col]
+                    used_model = entry["model"]
+                    used_features = entry["features"]
+                    used_label = target_col
+                inp = _try_extract_prediction_inputs(question, used_features, df)
                 if inp:
                     try:
-                        row = pd.DataFrame([inp])[feature_names]
-                        pred = model.predict(row)
-                        pred_info = f"\n\n[MODEL RUN] Inputs: {inp} -> Prediction: {pred[0]}"
-                        if has_labels and hasattr(model, "predict_proba"):
-                            probs = model.predict_proba(row)
-                            prob_str = "; ".join([f"{c}: {p:.3f}" for c, p in zip(model.classes_, probs[0])])
-                            pred_info += f"\nProbabilities: {prob_str}"
+                        row = pd.DataFrame([inp])[used_features]
+                        pred = used_model.predict(row)
+                        pred_info = f"\n\n[MODEL RUN] Inputs: {inp} -> Predicted {used_label}: {pred[0]}"
+                        if hasattr(used_model, "predict_proba"):
+                            try:
+                                probs = used_model.predict_proba(row)
+                                prob_str = "; ".join([f"{c}: {p:.3f}" for c, p in zip(used_model.classes_, probs[0])])
+                                pred_info += f"\nProbabilities: {prob_str}"
+                            except Exception:
+                                pass
                         st.session_state._last_pred = pred_info
                     except Exception as e:
                         pred_info = f"\n\n[Model run attempted but failed: {e}]"
                 elif _is_prediction_question(question):
-                    pred_info = "\n\n[MODEL RUN on data] " + _run_bulk_predictions(model, df, feature_names, has_labels)
+                    pred_info = "\n\n[MODEL RUN on data] " + _run_bulk_predictions(used_model, df, used_features, used_label is not None)
                     st.session_state._last_pred = pred_info
 
                 user_msg = question + pred_info
@@ -393,10 +447,24 @@ Your job:
         with st.chat_message("user"):
             st.markdown(pending)
         _answer_question(pending)
+        # Remove asked question from cache so it doesn't reappear
+        cache = st.session_state.get("_suggestions_cache", [])
+        if pending in cache:
+            cache.remove(pending)
+        # Regenerate replacement questions if cache runs low
+        if len(cache) < 2:
+            new_qs = _suggested_questions(df, feature_names, label_cols, task_type, gen_metrics, api_key, model_ensemble)
+            for q in new_qs:
+                if q not in cache and q != pending:
+                    cache.append(q)
+                    if len(cache) >= 3:
+                        break
 
-    # Suggested questions as clickable chips
-    suggestions = _suggested_questions(df, feature_names, label_cols, task_type, gen_metrics, api_key)
-    if suggestions and len(st.session_state.chat_messages) == 0:
+    # Suggested questions as clickable chips (cached in session state)
+    if "_suggestions_cache" not in st.session_state:
+        st.session_state._suggestions_cache = _suggested_questions(df, feature_names, label_cols, task_type, gen_metrics, api_key, model_ensemble)
+    suggestions = st.session_state._suggestions_cache
+    if suggestions:
         st.caption("Try asking:")
         ncols = min(3, len(suggestions))
         for i in range(0, len(suggestions), ncols):
@@ -416,10 +484,11 @@ Your job:
 
     if st.button("Clear Chat History"):
         st.session_state.chat_messages = []
+        st.session_state.pop("_suggestions_cache", None)
         st.rerun()
 
 
-def show_playground(df: pd.DataFrame, model_instance, model_module, model_code: str, text_cols: list, label_cols: list, env_api_key: str = "", gen_metrics: dict = None):
+def show_playground(df: pd.DataFrame, model_instance, model_module, model_code: str, text_cols: list, label_cols: list, env_api_key: str = "", gen_metrics: dict = None, model_ensemble: dict = None):
     info = {"exists": model_instance is not None}
     if not info["exists"]:
         st.warning("No trained model found. Train a model on the Fine-Tune screen first.")
@@ -429,7 +498,7 @@ def show_playground(df: pd.DataFrame, model_instance, model_module, model_code: 
     with st.sidebar:
         st.markdown("---")
         if st.button("Delete Trained Model", type="primary", use_container_width=True):
-            for k in ["gen_model_instance", "gen_model_module", "gen_model_code", "gen_metrics", "gen_dir"]:
+            for k in ["gen_model_instance", "gen_model_module", "gen_model_code", "gen_metrics", "gen_dir", "gen_model_ensemble"]:
                 if k in st.session_state:
                     del st.session_state[k]
             st.success("Model deleted from browser memory.")
@@ -582,4 +651,4 @@ def show_playground(df: pd.DataFrame, model_instance, model_module, model_code: 
         if not api_key:
             st.info("Enter a Groq API key above to start chatting with your model and data.")
         else:
-            show_chat_tab(api_key, df, model, module, feature_names, label_cols, task_type, has_labels, gen_metrics)
+            show_chat_tab(api_key, df, model, module, feature_names, label_cols, task_type, has_labels, gen_metrics, model_ensemble)

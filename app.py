@@ -29,7 +29,7 @@ from pipeline.format import to_instruction_jsonl, to_chat_jsonl
 from pipeline.playground import show_playground
 from utils.display import show_before_after, show_format_preview
 
-MODEL_SESSION_KEYS = ["gen_model_instance", "gen_model_module", "gen_model_code", "gen_metrics", "gen_dir"]
+MODEL_SESSION_KEYS = ["gen_model_instance", "gen_model_module", "gen_model_code", "gen_metrics", "gen_dir", "gen_model_ensemble"]
 
 def clear_model_session_state():
     for k in MODEL_SESSION_KEYS:
@@ -47,6 +47,7 @@ class GeneratedModel:
         self.model = RandomForestClassifier(n_estimators=100, random_state=42)
 
     def train(self, df, text_cols, label_cols):
+        self.feature_names_ = text_cols
         X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
         y = df[label_cols[0]] if label_cols else None
         if y is not None:
@@ -54,9 +55,11 @@ class GeneratedModel:
         else:
             self.model.fit(X)
 
-    def predict(self, df, text_cols):
-        X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
-        return self.model.predict(X)
+    def predict(self, X):
+        if isinstance(X, dict):
+            X = pd.DataFrame([X])
+        X_num = X[self.feature_names_].select_dtypes(include=[np.number]).fillna(0)
+        return self.model.predict(X_num)
 
     def evaluate(self, df, text_cols, label_cols):
         X = df[text_cols].select_dtypes(include=[np.number]).fillna(0)
@@ -92,13 +95,18 @@ class GeneratedModel:
     def _prepare_y(self, df, label_cols):
         if not label_cols:
             return None
-        y = df[label_cols[0]].ffill().bfill().fillna(0)
+        y = df[label_cols[0]]
+        if isinstance(y, pd.DataFrame):
+            y = y.iloc[:, 0]
+        y = y.ffill().bfill().fillna(0)
         if y.dtype.kind == "b":
             y = y.astype(int)
         return y
 
     def train(self, df, text_cols, label_cols):
-        X = self._prepare_X(df, text_cols)
+        feat_cols = [c for c in text_cols if not label_cols or c not in label_cols] or text_cols[:5]
+        self.feature_names_ = feat_cols
+        X = self._prepare_X(df, feat_cols)
         y = self._prepare_y(df, label_cols)
         if y is not None:
             if y.dtype.kind in ("O",) or y.nunique() < 20:
@@ -113,9 +121,13 @@ class GeneratedModel:
             self.model.fit(X)
             self._mode = "unsup"
 
-    def predict(self, df, text_cols):
-        X = self._prepare_X(df, text_cols)
-        return self.model.predict(X)
+    def predict(self, X):
+        if isinstance(X, dict):
+            X = pd.DataFrame([X])
+        X_num = X[self.feature_names_].select_dtypes(include=[np.number]).fillna(0)
+        if X_num.shape[1] == 0:
+            X_num = pd.DataFrame(np.zeros((len(X_num), 1)), columns=["_fb"])
+        return self.model.predict(X_num)
 
     def evaluate(self, df, text_cols, label_cols):
         X = self._prepare_X(df, text_cols)
@@ -233,22 +245,32 @@ class GeneratedModel:
     def _prepare_y(self, df, label_cols):
         if not label_cols:
             return None
-        y = df[label_cols[0]].ffill().bfill().fillna(0)
+        y = df[label_cols[0]]
+        if isinstance(y, pd.DataFrame):
+            y = y.iloc[:, 0]
+        y = y.ffill().bfill().fillna(0)
         if y.dtype.kind == "b":
             y = y.astype(int)
         return y
 
     def train(self, df, text_cols, label_cols):
-        X = self._prepare_X(df, text_cols)
+        feat_cols = [c for c in text_cols if not label_cols or c not in label_cols] or text_cols[:5]
+        self.feature_names_ = feat_cols
+        X = self._prepare_X(df, feat_cols)
         y = self._prepare_y(df, label_cols)
         self.model.fit(X, y)
 
-    def predict(self, df, text_cols):
-        X = self._prepare_X(df, text_cols)
-        return self.model.predict(X)
+    def predict(self, X):
+        if isinstance(X, dict):
+            X = pd.DataFrame([X])
+        X_num = X[self.feature_names_].select_dtypes(include=[np.number]).fillna(0)
+        if X_num.shape[1] == 0:
+            X_num = pd.DataFrame(np.zeros((len(X_num), 1)), columns=["_fb"])
+        return self.model.predict(X_num)
 
     def evaluate(self, df, text_cols, label_cols):
-        X = self._prepare_X(df, text_cols)
+        feat_cols = [c for c in text_cols if not label_cols or c not in label_cols] or text_cols[:5]
+        X = self._prepare_X(df, feat_cols)
         y = self._prepare_y(df, label_cols)
         if y is None:
             return {"note": "No labels"}
@@ -271,14 +293,19 @@ class GeneratedModel:
         return X
 
     def train(self, df, text_cols, label_cols):
+        self.feature_names_ = text_cols
         X = self._prepare_X(df, text_cols)
         n = min(3, len(X))
         self.model = KMeans(n_clusters=n, random_state=42, n_init="auto")
         self.model.fit(X)
 
-    def predict(self, df, text_cols):
-        X = self._prepare_X(df, text_cols)
-        return self.model.predict(X)
+    def predict(self, X):
+        if isinstance(X, dict):
+            X = pd.DataFrame([X])
+        X_num = X[self.feature_names_].select_dtypes(include=[np.number]).fillna(0)
+        if X_num.shape[1] == 0:
+            X_num = pd.DataFrame(np.zeros((len(X_num), 1)), columns=["_fb"])
+        return self.model.predict(X_num)
 
     def evaluate(self, df, text_cols, label_cols):
         X = self._prepare_X(df, text_cols)
@@ -305,29 +332,38 @@ class GeneratedModel:
     def _prepare_y(self, df, label_cols):
         if not label_cols:
             return None
-        y = df[label_cols[0]].ffill().bfill().fillna(0)
+        y = df[label_cols[0]]
+        if isinstance(y, pd.DataFrame):
+            y = y.iloc[:, 0]
+        y = y.ffill().bfill().fillna(0)
         if y.dtype.kind == "b":
             y = y.astype(int)
         return y
 
     def train(self, df, text_cols, label_cols):
-        X = self._prepare_X(df, text_cols)
+        feat_cols = [c for c in text_cols if not label_cols or c not in label_cols] or text_cols[:5]
+        self.feature_names_ = feat_cols
+        X = self._prepare_X(df, feat_cols)
         y = self._prepare_y(df, label_cols)
         self.model.fit(X, y)
 
-    def predict(self, df, text_cols):
-        X = self._prepare_X(df, text_cols)
-        return self.model.predict(X)
+    def predict(self, X):
+        if isinstance(X, dict):
+            X = pd.DataFrame([X])
+        X_num = X[self.feature_names_].select_dtypes(include=[np.number]).fillna(0)
+        if X_num.shape[1] == 0:
+            X_num = pd.DataFrame(np.zeros((len(X_num), 1)), columns=["_fb"])
+        return self.model.predict(X_num)
 
     def evaluate(self, df, text_cols, label_cols):
-        X = self._prepare_X(df, text_cols)
+        feat_cols = [c for c in text_cols if not label_cols or c not in label_cols] or text_cols[:5]
+        X = self._prepare_X(df, feat_cols)
         y = self._prepare_y(df, label_cols)
         if y is None:
             return {"note": "No labels for evaluation"}
         preds = self.model.predict(X)
         return {"accuracy": round(accuracy_score(y, preds), 4), "classification_report": classification_report(y, preds, output_dict=True, zero_division=0)}
 '''
-
 
 AVAILABLE_MODELS = {
     "TinyLlama-1.1B": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -627,7 +663,7 @@ elif screen == "3. Format & Export":
     if not text_cols:
         cols = list(cleaned.columns)
         text_cols = st.multiselect("Input columns", cols, default=cols[:1], key="fmt_text_cols")
-        label_cols = st.multiselect("Output/label columns (optional)", cols, key="fmt_label_cols") or None
+        label_cols = st.multiselect("Output/label columns (select just 1 — the column to predict)", cols, default=[cols[-1]] if cols else [], key="fmt_label_cols") or None
     else:
         label_info = f"{len(label_cols)} label column(s)" if label_cols else "no label columns"
         st.success(f"Using {len(text_cols)} input column(s) | {label_info}")
@@ -732,7 +768,8 @@ elif screen == "4. Fine-Tune":
                 key="ft_text_cols",
             )
         with c2:
-            ft_label = st.multiselect("Output/label columns (optional)", valid_columns, default=label_cols if label_cols else [], key="ft_label_cols") or None
+            label_default = label_cols if label_cols else [valid_columns[-1]] if valid_columns else []
+            ft_label = st.multiselect("Output/label columns (select just 1 — the column to predict)", valid_columns, default=label_default, key="ft_label_cols") or None
         if ft_text:
             text_cols = ft_text
             label_cols = ft_label
@@ -879,76 +916,91 @@ elif screen == "4. Fine-Tune":
         st.subheader("Step 3: Train This Model on Your Data")
 
         if st.button("Train Generated Model", type="primary"):
+            # Deduplicate column names (e.g. after snake_case rename)
+            if cleaned.columns.duplicated().any():
+                cleaned = cleaned.loc[:, ~cleaned.columns.duplicated(keep="first")]
             cols = list(cleaned.columns)
-            # Validate all column references against actual dataframe columns
-            train_text_cols = [c for c in (text_cols or []) if c in cols]
             train_label_cols = [c for c in (label_cols or []) if c in cols] if label_cols else None
+            train_text_cols = [c for c in (text_cols or []) if c in cols] if text_cols else None
             if not train_text_cols:
-                train_text_cols = cols[:3] if not train_label_cols else [c for c in cols if c not in train_label_cols][:5]
-            if train_label_cols:
-                train_df = cleaned[train_text_cols + train_label_cols].copy()
+                train_text_cols = [c for c in cols if not train_label_cols or c not in train_label_cols][:5]
+            if not train_text_cols:
+                st.error("No feature columns remaining after excluding labels.")
+                st.stop()
+            # Build target list: if all columns are labels, train one model per column
+            if train_label_cols and len(train_label_cols) >= len(cols) - 1:
+                target_columns = train_label_cols[:]
+            elif train_label_cols:
+                target_columns = train_label_cols[:1]
             else:
-                train_df = cleaned[train_text_cols].copy()
+                target_columns = []
 
-            st.session_state.train_log = [f"Training on {len(cleaned)} rows", f"Features: {train_text_cols}", f"Labels: {train_label_cols}"]
+            st.session_state.train_log = [f"Training on {len(cleaned)} rows"]
+
+            import importlib.util, sys, tempfile
+
+            def _train_single_target(code_template, target_col, all_cols, log_callback):
+                feats = [c for c in all_cols if c != target_col][:10]
+                tdf = cleaned[feats + [target_col]].copy()
+                tmp = tempfile.mkdtemp(prefix="df_ens_")
+                cpath = os.path.join(tmp, "model.py")
+                with open(cpath, "w") as f:
+                    f.write(code_template)
+                spec = importlib.util.spec_from_file_location(f"gen_{target_col}", cpath)
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules[f"gen_{target_col}"] = mod
+                spec.loader.exec_module(mod)
+                inst = mod.GeneratedModel()
+                log_callback(f"  Training {target_col} ({len(feats)} features)...")
+                inst.train(tdf, feats, [target_col])
+                m = inst.evaluate(tdf, feats, [target_col])
+                log_callback(f"  {target_col} done")
+                return {"model": inst, "module": mod, "features": feats, "metrics": m}
+
+            ensemble = {}
+            all_metrics = {}
 
             try:
-                import importlib.util, sys, tempfile
-                # Write generated code to temp file for importlib
-                tmp_dir = tempfile.mkdtemp(prefix="dataforge_")
-                tmp_code_path = os.path.join(tmp_dir, "generated_model.py")
-                with open(tmp_code_path, "w") as f:
-                    f.write(result["code"])
+                for target in target_columns:
+                    result_ens = _train_single_target(result["code"], target, cols, lambda msg: st.session_state.train_log.append(msg))
+                    ensemble[target] = result_ens
+                    all_metrics[target] = result_ens["metrics"]
+                    for k, v in result_ens["metrics"].items():
+                        if isinstance(v, (int, float)):
+                            st.session_state.train_log.append(f"  → {target} {k}: {v:.4f}")
 
-                spec = importlib.util.spec_from_file_location("gen_model", tmp_code_path)
-                mod = importlib.util.module_from_spec(spec)
-                sys.modules["gen_model"] = mod
-                spec.loader.exec_module(mod)
-
-                model_instance = mod.GeneratedModel()
-                st.session_state.train_log.append(f"Training on {len(train_df)} rows...")
-                model_instance.train(train_df, train_text_cols, train_label_cols)
-                st.session_state.train_log.append("Training complete")
-
-                metrics = model_instance.evaluate(train_df, train_text_cols, train_label_cols)
-                st.session_state.train_log.append(f"Metrics: {json.dumps(metrics, default=str)}")
-
-                st.session_state.gen_metrics = metrics
-                st.session_state.gen_model_instance = model_instance
-                st.session_state.gen_model_module = mod
+                st.session_state.gen_model_ensemble = ensemble
+                st.session_state.gen_model_instance = ensemble[target_columns[0]]["model"]
+                st.session_state.gen_model_module = ensemble[target_columns[0]]["module"]
                 st.session_state.gen_model_code = result["code"]
+                st.session_state.gen_metrics = all_metrics
                 st.session_state.train_text_cols = train_text_cols
                 st.session_state.train_label_cols = train_label_cols
                 st.session_state.training = False
-                st.success("Training complete!")
+                st.success(f"Trained {len(ensemble)} models! Use the Playground to ask about any column.")
                 st.rerun()
             except Exception as e:
-                st.session_state.train_log.append(f"Generated model failed: {e}")
+                st.session_state.train_log.append(f"Generated model ensemble failed: {e}")
                 st.session_state.train_log.append("Falling back to data-matched model...")
                 try:
                     fallback_code = _model_code_for_assessment(assessment) if assessment else _safe_model_code()
-                    tmp_dir2 = tempfile.mkdtemp(prefix="dataforge_fb_")
-                    fb_code_path = os.path.join(tmp_dir2, "fallback_model.py")
-                    with open(fb_code_path, "w") as f:
-                        f.write(fallback_code)
-                    fb_spec = importlib.util.spec_from_file_location("gen_model_fb", fb_code_path)
-                    fb_mod = importlib.util.module_from_spec(fb_spec)
-                    sys.modules["gen_model_fb"] = fb_mod
-                    fb_spec.loader.exec_module(fb_mod)
-                    model_instance = fb_mod.GeneratedModel()
-                    st.session_state.train_log.append("Fallback: training safe model...")
-                    model_instance.train(train_df, train_text_cols, train_label_cols)
-                    metrics = model_instance.evaluate(train_df, train_text_cols, train_label_cols)
-                    st.session_state.gen_metrics = metrics
-                    st.session_state.gen_model_instance = model_instance
-                    st.session_state.gen_model_module = fb_mod
+                    for target in target_columns:
+                        result_ens = _train_single_target(fallback_code, target, cols, lambda msg: st.session_state.train_log.append(msg))
+                        ensemble[target] = result_ens
+                        all_metrics[target] = result_ens["metrics"]
+                        for k, v in result_ens["metrics"].items():
+                            if isinstance(v, (int, float)):
+                                st.session_state.train_log.append(f"  → {target} {k}: {v:.4f}")
+                    st.session_state.gen_model_ensemble = ensemble
+                    st.session_state.gen_model_instance = ensemble[target_columns[0]]["model"]
+                    st.session_state.gen_model_module = ensemble[target_columns[0]]["module"]
                     st.session_state.gen_model_code = fallback_code
                     st.session_state.train_text_cols = train_text_cols
                     st.session_state.train_label_cols = train_label_cols
                     st.session_state.training = False
                     task = assessment.get("task_type", "model").title() if assessment else "Model"
-                    st.warning(f"AI model had issues — {task} fallback model trained successfully instead.")
-                    st.session_state.train_log.append(f"{task} fallback model trained successfully.")
+                    st.warning(f"AI model had issues — {task} fallback ensemble trained successfully instead.")
+                    st.session_state.train_log.append(f"{task} ensemble trained successfully.")
                     st.rerun()
                 except Exception as e2:
                     st.session_state.train_log.append(f"Fallback also failed: {e2}")
@@ -964,24 +1016,27 @@ elif screen == "4. Fine-Tune":
 
         # Show trained model results
         if st.session_state.get("gen_metrics"):
-            st.success("Your generated model has been trained!")
+            st.success("Your model ensemble has been trained!")
             st.subheader("Model Metrics")
             try:
-                metrics = st.session_state.gen_metrics
-                c1, c2, c3 = st.columns(3)
-                i = 0
-                for k, v in metrics.items():
-                    if isinstance(v, float):
-                        with [c1, c2, c3][i % 3]:
-                            st.metric(k.replace("_", " ").title(), f"{v:.4f}")
-                        i += 1
-                for k, v in metrics.items():
-                    if isinstance(v, dict) and k == "classification_report":
-                        with st.expander("Classification Report", expanded=False):
-                            st.json(v)
-                    elif not isinstance(v, float):
-                        with st.expander(k.replace("_", " ").title(), expanded=False):
-                            st.write(v)
+                all_metrics = st.session_state.gen_metrics
+                ensemble = st.session_state.get("gen_model_ensemble", {})
+                targets = list(all_metrics.keys()) if isinstance(all_metrics, dict) and not any(isinstance(v, float) for v in all_metrics.values()) else ["model"]
+                for target in targets:
+                    with st.expander(f"{target} Performance", expanded=(target == targets[0])):
+                        m = all_metrics[target] if isinstance(all_metrics, dict) else all_metrics
+                        c1, c2, c3 = st.columns(3)
+                        i = 0
+                        for k, v in m.items():
+                            if isinstance(v, float):
+                                with [c1, c2, c3][i % 3]:
+                                    st.metric(k.replace("_", " ").title(), f"{v:.4f}")
+                                i += 1
+                        for k, v in m.items():
+                            if isinstance(v, dict) and k == "classification_report":
+                                st.json(v)
+                            elif not isinstance(v, float):
+                                st.write(f"{k}: {v}")
             except Exception as e:
                 st.caption(f"Metrics display error: {e}")
 
@@ -1120,11 +1175,12 @@ elif screen == "5. Model Playground":
         st.warning("Clean your data first on the Profile & Clean screen.")
         st.stop()
 
+    model_ensemble = st.session_state.get("gen_model_ensemble", {})
     model_instance = st.session_state.get("gen_model_instance")
     model_module = st.session_state.get("gen_model_module")
     model_code = st.session_state.get("gen_model_code")
 
-    if not model_instance:
+    if not model_instance and not model_ensemble:
         st.info("No trained model found. Go to **Fine-Tune** screen to generate and train a model first.")
         st.stop()
 
@@ -1133,6 +1189,6 @@ elif screen == "5. Model Playground":
     label_cols = st.session_state.get("train_label_cols") or st.session_state.get("label_cols", [])
 
     try:
-        show_playground(cleaned, model_instance, model_module, model_code, text_cols, label_cols, GROQ_API_KEY, st.session_state.get("gen_metrics", {}))
+        show_playground(cleaned, model_instance or list(model_ensemble.values())[0]["model"] if model_ensemble else None, model_module, model_code, text_cols, label_cols, GROQ_API_KEY, st.session_state.get("gen_metrics", {}), model_ensemble)
     except Exception as e:
         st.error(f"Playground error: {e}")

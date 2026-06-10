@@ -79,8 +79,14 @@ class GeneratedModel:
 
     def train(self, df, text_cols, label_cols):
         if label_cols and len(label_cols) > 0:
-            feature_cols = [c for c in text_cols if c not in label_cols] or text_cols
-            X = df[feature_cols].copy(); y = df[label_cols].values.ravel()
+            feature_cols = [c for c in text_cols if c not in label_cols]
+            if not feature_cols:
+                feature_cols = [c for c in df.columns if c not in label_cols]
+            if not feature_cols:
+                fallback_col = label_cols[0]
+                feature_cols = [c for c in df.columns if c != fallback_col][:3]
+            X = df[feature_cols].copy()
+            y = df[label_cols[0]].values.ravel() if len(label_cols) > 0 else None
         else:
             X = df[text_cols].copy() if text_cols else df.copy(); y = None
         self.feature_names_ = X.columns.tolist()
