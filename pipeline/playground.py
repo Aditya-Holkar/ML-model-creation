@@ -83,21 +83,44 @@ def extract_feature_importance(model, feature_names: list) -> pd.DataFrame | Non
         return None
 
 
+def _get_cached_column_stats(df, feature_names):
+    CACHE_KEY = "_playground_col_stats"
+    if CACHE_KEY not in st.session_state:
+        stats = {}
+        for col in feature_names:
+            if col not in df.columns:
+                continue
+            if pd.api.types.is_numeric_dtype(df[col]):
+                stats[col] = {
+                    "dtype": "numeric",
+                    "min": float(df[col].min()),
+                    "max": float(df[col].max()),
+                    "median": float(df[col].median()),
+                }
+            else:
+                stats[col] = {
+                    "dtype": "categorical",
+                    "values": df[col].dropna().unique().tolist(),
+                }
+        st.session_state[CACHE_KEY] = stats
+    return st.session_state[CACHE_KEY]
+
+
 def build_prediction_inputs(df: pd.DataFrame, feature_names: list, label_cols: list):
     inputs = {}
     st.subheader("Enter Feature Values")
+    col_stats = _get_cached_column_stats(df, feature_names)
     with st.container(border=True):
         cols_per_row = st.columns(3)
         for i, col in enumerate(feature_names):
             with cols_per_row[i % 3]:
-                if pd.api.types.is_numeric_dtype(df[col]):
-                    cmin = float(df[col].min())
-                    cmax = float(df[col].max())
-                    cmid = float(df[col].median())
-                    inputs[col] = st.slider(col, min_value=cmin, max_value=cmax, value=cmid, format="%.2f")
+                stat = col_stats.get(col)
+                if stat is None:
+                    continue
+                if stat["dtype"] == "numeric":
+                    inputs[col] = st.slider(col, min_value=stat["min"], max_value=stat["max"], value=stat["median"], format="%.2f")
                 else:
-                    unique = df[col].dropna().unique().tolist()
-                    inputs[col] = st.selectbox(col, unique)
+                    inputs[col] = st.selectbox(col, stat["values"])
     return inputs
 
 
@@ -118,62 +141,68 @@ def predict_from_inputs(model, inputs: dict, feature_names: list, module, label_
 
 
 def _build_data_context(df: pd.DataFrame, feature_names: list, label_cols: list, task_type: str) -> str:
-    parts = []
-    parts.append(f"Task: {task_type}")
-    feature_names = [c for c in feature_names if c in df.columns]
-    parts.append(f"Features ({len(feature_names)}): {', '.join(feature_names)}")
-    if label_cols:
-        label_cols = [c for c in label_cols if c in df.columns]
-        parts.append(f"Target: {', '.join(label_cols)}")
-    shape = df.shape
-    parts.append(f"Rows: {shape[0]}")
-    numeric_cols = df[feature_names].select_dtypes(include=np.number).columns.tolist()
-    if numeric_cols:
-        stats = df[numeric_cols].describe().to_dict()
-        parts.append(f"Numeric stats: {json.dumps(stats, default=str)}")
-    cat_cols = [c for c in feature_names if not pd.api.types.is_numeric_dtype(df[c])]
-    if cat_cols:
-        val_counts = {}
-        for c in cat_cols:
-            try:
-                val_counts[c] = df[c].value_counts().head(5).to_dict()
-            except Exception:
-                pass
-        if val_counts:
-            parts.append(f"Categorical values: {json.dumps(val_counts, default=str)}")
-    cols_for_sample = feature_names + (label_cols or [])
-    cols_for_sample = [c for c in cols_for_sample if c in df.columns]
-    if cols_for_sample:
-        sample = df[cols_for_sample].head(5).to_dict(orient="records")
-        parts.append(f"Sample rows: {json.dumps(sample, default=str)}")
-    return "\n".join(parts)
+    CACHE_KEY = "_playground_data_context"
+    if CACHE_KEY not in st.session_state:
+        parts = []
+        parts.append(f"Task: {task_type}")
+        feature_names = [c for c in feature_names if c in df.columns]
+        parts.append(f"Features ({len(feature_names)}): {', '.join(feature_names)}")
+        if label_cols:
+            label_cols = [c for c in label_cols if c in df.columns]
+            parts.append(f"Target: {', '.join(label_cols)}")
+        shape = df.shape
+        parts.append(f"Rows: {shape[0]}")
+        numeric_cols = df[feature_names].select_dtypes(include=np.number).columns.tolist()
+        if numeric_cols:
+            stats = df[numeric_cols].describe().to_dict()
+            parts.append(f"Numeric stats: {json.dumps(stats, default=str)}")
+        cat_cols = [c for c in feature_names if not pd.api.types.is_numeric_dtype(df[c])]
+        if cat_cols:
+            val_counts = {}
+            for c in cat_cols:
+                try:
+                    val_counts[c] = df[c].value_counts().head(5).to_dict()
+                except Exception:
+                    pass
+            if val_counts:
+                parts.append(f"Categorical values: {json.dumps(val_counts, default=str)}")
+        cols_for_sample = feature_names + (label_cols or [])
+        cols_for_sample = [c for c in cols_for_sample if c in df.columns]
+        if cols_for_sample:
+            sample = df[cols_for_sample].head(5).to_dict(orient="records")
+            parts.append(f"Sample rows: {json.dumps(sample, default=str)}")
+        st.session_state[CACHE_KEY] = "\n".join(parts)
+    return st.session_state[CACHE_KEY]
 
 
 def _build_model_context(model, feature_names: list, has_labels: bool, task_type: str, gen_metrics: dict = None) -> str:
-    parts = []
-    parts.append(f"Algorithm: {type(model).__name__}")
-    if hasattr(model, "get_params"):
-        parts.append(f"Params: {json.dumps(model.get_params(), default=str)}")
-    fi = extract_feature_importance(model, feature_names)
-    if fi is not None:
-        top5 = fi.head(5).to_dict(orient="records")
-        parts.append(f"Top features: {json.dumps(top5, default=str)}")
-    parts.append(f"Predict mode: {'predict_proba available' if has_labels and hasattr(model, 'predict_proba') else 'predict only'}")
-    if gen_metrics:
-        flat = {}
-        is_ensemble = isinstance(gen_metrics, dict) and not any(isinstance(v, float) for v in gen_metrics.values())
-        if is_ensemble:
-            for t, m in gen_metrics.items():
-                for k, v in m.items():
+    CACHE_KEY = "_playground_model_context"
+    if CACHE_KEY not in st.session_state:
+        parts = []
+        parts.append(f"Algorithm: {type(model).__name__}")
+        if hasattr(model, "get_params"):
+            parts.append(f"Params: {json.dumps(model.get_params(), default=str)}")
+        fi = extract_feature_importance(model, feature_names)
+        if fi is not None:
+            top5 = fi.head(5).to_dict(orient="records")
+            parts.append(f"Top features: {json.dumps(top5, default=str)}")
+        parts.append(f"Predict mode: {'predict_proba available' if has_labels and hasattr(model, 'predict_proba') else 'predict only'}")
+        if gen_metrics:
+            flat = {}
+            is_ensemble = isinstance(gen_metrics, dict) and not any(isinstance(v, float) for v in gen_metrics.values())
+            if is_ensemble:
+                for t, m in gen_metrics.items():
+                    for k, v in m.items():
+                        if isinstance(v, (int, float)):
+                            flat[f"{t}_{k}"] = round(v, 4)
+            else:
+                for k, v in gen_metrics.items():
                     if isinstance(v, (int, float)):
-                        flat[f"{t}_{k}"] = round(v, 4)
-        else:
-            for k, v in gen_metrics.items():
-                if isinstance(v, (int, float)):
-                    flat[k] = round(v, 4)
-        if flat:
-            parts.append(f"Metrics: {json.dumps(flat)}")
-    return "\n".join(parts)
+                        flat[k] = round(v, 4)
+            if flat:
+                parts.append(f"Metrics: {json.dumps(flat)}")
+        st.session_state[CACHE_KEY] = "\n".join(parts)
+    return st.session_state[CACHE_KEY]
 
 
 def _query_llm(system_prompt: str, user_msg: str, api_key: str, chat_history: list) -> str:

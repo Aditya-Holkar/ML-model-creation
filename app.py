@@ -30,9 +30,10 @@ from pipeline.playground import show_playground
 from utils.display import show_before_after, show_format_preview
 
 MODEL_SESSION_KEYS = ["gen_model_instance", "gen_model_module", "gen_model_code", "gen_metrics", "gen_dir", "gen_model_ensemble"]
+PLAYGROUND_CACHE_KEYS = ["_playground_col_stats", "_playground_data_context", "_playground_model_context"]
 
 def clear_model_session_state():
-    for k in MODEL_SESSION_KEYS:
+    for k in MODEL_SESSION_KEYS + PLAYGROUND_CACHE_KEYS:
         if k in st.session_state:
             del st.session_state[k]
 
@@ -804,11 +805,13 @@ elif screen == "4. Fine-Tune":
 
             def _compute_metrics(y_true, y_pred, model_name):
                 from sklearn.metrics import accuracy_score, r2_score, classification_report, mean_squared_error
+                import numpy as np
                 name = model_name.lower()
                 if "classifier" in name or "svc" in name:
                     return {"accuracy": round(accuracy_score(y_true, y_pred), 4), "classification_report": classification_report(y_true, y_pred, output_dict=True, zero_division=0)}
                 if "regressor" in name or "svr" in name or "regression" in name:
-                    return {"r2_score": round(r2_score(y_true, y_pred), 4), "mse": round(mean_squared_error(y_true, y_pred), 4)}
+                    mse = mean_squared_error(y_true, y_pred)
+                    return {"r2_score": round(r2_score(y_true, y_pred), 4), "rmse": round(float(np.sqrt(mse)), 2)}
                 return {}
 
             def _ensure_n_jobs(model):
@@ -820,9 +823,14 @@ elif screen == "4. Fine-Tune":
 
             def _train_ensemble(code_template):
                 _log("Compiling model code...")
-                ns = {}
-                exec(compile(code_template, "<model>", "exec"), ns)
-                ModelClass = ns["GeneratedModel"]
+                import sys, types
+                _mod_name = "dataforge_gen_model"
+                if _mod_name in sys.modules:
+                    del sys.modules[_mod_name]
+                _mod = types.ModuleType(_mod_name)
+                exec(compile(code_template, _mod_name, "exec"), _mod.__dict__)
+                sys.modules[_mod_name] = _mod
+                ModelClass = _mod.GeneratedModel
 
                 proto = ModelClass()
                 X_all = train_df[feature_cols]
@@ -866,6 +874,8 @@ elif screen == "4. Fine-Tune":
                     st.error(f"Training failed: {e2}")
                     st.stop()
 
+            for _ck in PLAYGROUND_CACHE_KEYS:
+                st.session_state.pop(_ck, None)
             st.session_state.gen_model_ensemble = ensemble
             st.session_state.gen_model_instance = list(ensemble.values())[0]["model"]
             st.session_state.gen_model_module = None
