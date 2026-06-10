@@ -1,7 +1,5 @@
-import nbformat as nbf
-
-
 def generate_colab_notebook(hf_dataset_repo: str, model_name: str = "TinyLlama-1.1B") -> str:
+    import nbformat as nbf
     nb = nbf.v4.new_notebook()
     nb.metadata = {
         "accelerator": "GPU",

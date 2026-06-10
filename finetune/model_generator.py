@@ -153,7 +153,7 @@ def _validate_model_def(model_def: str, metric_type: str) -> str:
         tree = ast.parse(model_def.strip(), mode="eval")
         if isinstance(tree.body, ast.Call) and isinstance(tree.body.func, ast.Name):
             name = tree.body.func.id
-            if name not in _SKLEARN_SHIM:
+            if name not in _get_sklearn_shim():
                 print(f"WARN: Unknown model '{name}', falling back to default for '{metric_type}'")
                 return _DEFAULT_MODELS.get(metric_type, "RandomForestClassifier(n_estimators=100, random_state=42)")
     except Exception:
@@ -187,7 +187,7 @@ def _strip_bad_kwargs(model_def: str) -> str:
     import re
     for _ in range(5):
         try:
-            eval(model_def, {"__builtins__": {}}, _SKLEARN_SHIM)
+            eval(model_def, {"__builtins__": {}}, _get_sklearn_shim())
             break
         except (TypeError, NameError) as e:
             m = re.search(r"'(\w+)'", str(e))
@@ -199,17 +199,20 @@ def _strip_bad_kwargs(model_def: str) -> str:
     return model_def
 
 
-_SKLEARN_SHIM = {
-    "RandomForestClassifier": __import__("sklearn.ensemble", fromlist=["RandomForestClassifier"]).RandomForestClassifier,
-    "RandomForestRegressor": __import__("sklearn.ensemble", fromlist=["RandomForestRegressor"]).RandomForestRegressor,
-    "LogisticRegression": __import__("sklearn.linear_model", fromlist=["LogisticRegression"]).LogisticRegression,
-    "LinearRegression": __import__("sklearn.linear_model", fromlist=["LinearRegression"]).LinearRegression,
-    "KMeans": __import__("sklearn.cluster", fromlist=["KMeans"]).KMeans,
-    "DecisionTreeClassifier": __import__("sklearn.tree", fromlist=["DecisionTreeClassifier"]).DecisionTreeClassifier,
-    "DecisionTreeRegressor": __import__("sklearn.tree", fromlist=["DecisionTreeRegressor"]).DecisionTreeRegressor,
-    "SVC": __import__("sklearn.svm", fromlist=["SVC"]).SVC,
-    "SVR": __import__("sklearn.svm", fromlist=["SVR"]).SVR,
-}
+def _get_sklearn_shim():
+    if not hasattr(_get_sklearn_shim, "_cache"):
+        _get_sklearn_shim._cache = {
+            "RandomForestClassifier": __import__("sklearn.ensemble", fromlist=["RandomForestClassifier"]).RandomForestClassifier,
+            "RandomForestRegressor": __import__("sklearn.ensemble", fromlist=["RandomForestRegressor"]).RandomForestRegressor,
+            "LogisticRegression": __import__("sklearn.linear_model", fromlist=["LogisticRegression"]).LogisticRegression,
+            "LinearRegression": __import__("sklearn.linear_model", fromlist=["LinearRegression"]).LinearRegression,
+            "KMeans": __import__("sklearn.cluster", fromlist=["KMeans"]).KMeans,
+            "DecisionTreeClassifier": __import__("sklearn.tree", fromlist=["DecisionTreeClassifier"]).DecisionTreeClassifier,
+            "DecisionTreeRegressor": __import__("sklearn.tree", fromlist=["DecisionTreeRegressor"]).DecisionTreeRegressor,
+            "SVC": __import__("sklearn.svm", fromlist=["SVC"]).SVC,
+            "SVR": __import__("sklearn.svm", fromlist=["SVR"]).SVR,
+        }
+    return _get_sklearn_shim._cache
 
 _SAFE_KWARGS = {
     "RandomForestClassifier": {"n_estimators", "max_depth", "min_samples_split", "min_samples_leaf", "random_state", "class_weight", "n_jobs"},

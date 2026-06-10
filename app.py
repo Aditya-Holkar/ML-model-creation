@@ -362,8 +362,13 @@ except ImportError:
     CLOUD_MODELS = []
     HAS_CLOUD_DEPS = False
 
-from finetune.model_config import generate_config as generate_model_config
-from finetune.model_generator import generate_model, train_generated_model, suggest_model
+try:
+    from finetune.model_config import generate_config as generate_model_config
+    from finetune.model_generator import generate_model, train_generated_model, suggest_model
+    HAS_MODEL_GEN_DEPS = True
+except ImportError:
+    generate_model_config = generate_model = train_generated_model = suggest_model = None
+    HAS_MODEL_GEN_DEPS = False
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY", "")
@@ -766,7 +771,7 @@ elif screen == "4. Fine-Tune":
     # ── Step 1: Describe → Generate Code ──
     st.subheader("Step 1: Describe or Paste Your Model Code")
 
-    if has_groq:
+    if has_groq and HAS_MODEL_GEN_DEPS:
         st.caption("Describe your ML goal. DataForge generates a real Python model for your data.")
         model_desc = st.text_area(
             "What should your model do?",
@@ -802,12 +807,16 @@ elif screen == "4. Fine-Tune":
 
         gen_btn = st.button("⚡ Generate Model Code", type="primary", disabled=not model_desc)
     else:
-        st.caption("Paste your sklearn model code below, or use the quick template.")
+        if has_groq and not HAS_MODEL_GEN_DEPS:
+            with st.warning("GROQ_API_KEY is set but model generation dependencies are missing."):
+                st.caption("Enter model code manually below.")
+        else:
+            st.caption("Paste your sklearn model code below, or use the quick template.")
         model_desc = ""
         gen_btn = False
 
-    # Manual code editor (shown when no API key, or after generation)
-    if not has_groq:
+    # Manual code editor (shown when no API key, missing deps, or after generation)
+    if not has_groq or (has_groq and not HAS_MODEL_GEN_DEPS):
         task_hint = assessment.get("task_type", "model").title() if assessment else "Model"
         DEFAULT_TEMPLATE = f"""# Paste your sklearn model code here, or click one of the buttons below.
 # It must define a class with train() and evaluate() methods.
