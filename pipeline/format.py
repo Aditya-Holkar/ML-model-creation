@@ -3,6 +3,8 @@ import pandas as pd
 
 
 def _concat_cols(row, cols, sep="\n"):
+    if not cols:
+        return ""
     parts = [str(row[c]) for c in cols if c in row.index]
     return sep.join(parts)
 
